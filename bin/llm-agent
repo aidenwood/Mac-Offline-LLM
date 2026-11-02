@@ -135,6 +135,56 @@ TOOLS = [
 
 WRITERS = {"write_file", "edit_file"}
 
+# "it ended by asking instead of building" — deliberately narrow so a report that
+# merely contains a question mark does not trip it.
+ASKED_A_QUESTION = re.compile(
+    r"(could you (provide|clarify|confirm|specify)|can you (provide|clarify|confirm|specify)"
+    r"|what (kind|sort|type) of|which (one|option|approach)|would you like"
+    r"|do you want|let me know|please (provide|clarify|specify|confirm)"
+    r"|more (details|information|context)|shall I|should I)",
+    re.I)
+
+
+# ─────────────────── text-format tool-call recovery ────────────────────────
+# Qwen-family templates fall back to emitting tool calls as TEXT whenever the
+# server's tool definitions go missing from the rendered prompt — which ollama's
+# qwen3-coder template does as soon as there is `tool` role history. The loop then
+# sees no tool_calls, treats it as a final answer, and the model reports success for
+# work it never did. Measured 2026-11-02: step 1 structured, step 2 text.
+#
+# Rather than fight the template, parse the text form too. A tool call the harness
+# can see is a tool call that actually runs; anything else is fiction.
+#
+#   <function=write_file>
+#   <parameter=path>
+#   hello.py
+#   </parameter>
+#   <parameter=content>
+#   print("hi")
+#   </parameter>
+#   </function>
+
+_FN_BLOCK = re.compile(r"<function=([A-Za-z0-9_]+)>(.*?)(?:</function>|\Z)", re.S)
+_PARAM = re.compile(r"<parameter=([A-Za-z0-9_]+)>\n?(.*?)\n?</parameter>", re.S)
+
+
+def recover_text_tool_calls(content):
+    """Return OpenAI-shaped tool_calls parsed out of a text response, or []."""
+    if not content or "<function=" not in content:
+        return []
+    out = []
+    for i, m in enumerate(_FN_BLOCK.finditer(content)):
+        name, body = m.group(1), m.group(2)
+        args = {k: v for k, v in _PARAM.findall(body)}
+        if not args:                      # also accept a bare JSON body
+            try:
+                args = json.loads(body.strip())
+            except Exception:
+                args = {}
+        out.append({"id": f"recovered_{i}", "type": "function",
+                    "function": {"name": name, "arguments": json.dumps(args)}})
+    return out
+
 
 def run_tool(name, args, workdir, yolo, transcript):
     def resolve(p):
@@ -185,10 +235,22 @@ def run_tool(name, args, workdir, yolo, transcript):
 
 # ───────────────────────────── system prompt ───────────────────────────────
 
+BUILD_NOW = (
+    "You are a coding agent working on Aiden Wood's machine.\n\n"
+    "NEVER ask a clarifying question. Aiden briefs in one short line and expects a "
+    "working V1, not a questionnaire. If the task is underspecified, choose the most "
+    "reasonable interpretation, BUILD IT, and state the assumption you made in one "
+    "line at the end.\n\n"
+    "Use the tools. Do not describe what you would do — do it. A response that "
+    "explains a plan without calling a tool is a failure.\n\n"
+    "Keep working until the task is actually finished: the files exist, and anything "
+    "the work obviously implies (a test, a README, the sibling file needing the same "
+    "edit) is done too."
+)
+
+
 def system_prompt(rules):
-    parts = ["You are a coding agent working on Aiden Wood's machine. "
-             "You have tools. Use them rather than guessing or describing what you "
-             "would do. Keep working until the task is actually finished."]
+    parts = [BUILD_NOW]
     if rules:
         for key in rules:
             name = HALL_ALIASES.get(key.strip(), key.strip())
@@ -283,11 +345,22 @@ def main():
                     {"role": "user", "content": a.task}]
 
     strikes = 0
+    wrote_anything = [False]
+    question_strike = [False]
     for step in range(a.max_steps):
         msg = chat(a.port, messages, a.model)
         messages.append(msg)
 
         calls = msg.get("tool_calls") or []
+        if not calls:
+            calls = recover_text_tool_calls(msg.get("content") or "")
+            if calls:
+                print(f"  (recovered {len(calls)} text-format tool call(s))",
+                      file=sys.stderr)
+                # Replace the text blob with the structured form so the next prompt
+                # render carries a clean tool-call history.
+                msg["content"] = ""
+                msg["tool_calls"] = calls
         if calls:
             for c in calls:
                 fn = c["function"]
@@ -298,6 +371,8 @@ def main():
                 print(f"  → {fn['name']}({', '.join(f'{k}={str(v)[:50]!r}' for k, v in args.items())})",
                       file=sys.stderr)
                 result = run_tool(fn["name"], args, workdir, a.yolo, transcript)
+                if fn["name"] in WRITERS and not str(result).startswith("ERROR"):
+                    wrote_anything[0] = True
                 messages.append({"role": "tool", "tool_call_id": c["id"],
                                  "content": str(result)[:20000]})
             continue
@@ -305,9 +380,29 @@ def main():
         # No tool calls — the model is trying to finish. This is the Stop moment.
         reason = hook("stop", {"session_id": sid,
                                "transcript_path": str(transcript.path)})
+
+        # The hook's work-turn test is "did it edit files", which is right for Claude
+        # Code but leaves a hole here: a local model handed an explicit build task can
+        # end the run by asking a clarifying question, edit nothing, and sail straight
+        # through as a "conversational turn". That is the exact smoke break the whip
+        # exists to stop. One forced retry, then it goes through — same one-strike
+        # shape as the hook, so it can never deadlock.
+        if reason is None and a.whip and not question_strike[0]:
+            body = msg.get("content") or ""
+            if not wrote_anything[0] and ASKED_A_QUESTION.search(body):
+                question_strike[0] = True
+                reason = (
+                    "You ended without building anything and asked a question instead. "
+                    "Do not ask — Aiden briefs in one line and expects a working V1.\n\n"
+                    "Pick the most reasonable interpretation of the task, BUILD IT with "
+                    "the tools now, and state your assumption in one line at the end."
+                )
+
         if reason:
             strikes += 1
-            print(f"\n⟳ WHIP (strike {strikes}) — forced to keep going\n", file=sys.stderr)
+            label = "asked instead of building" if question_strike[0] and strikes == 1 and not wrote_anything[0] else "under the floor"
+            print(f"\n⟳ WHIP (strike {strikes}, {label}) — forced to keep going\n",
+                  file=sys.stderr)
             messages.append({"role": "user", "content": reason})
             continue
 

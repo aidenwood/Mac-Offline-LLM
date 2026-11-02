@@ -139,6 +139,63 @@ survive.
 
 If you add a backend, test it both ways before trusting it.
 
+## Room: Text-format tool calls are recovered, not trusted
+
+The system-message fix above is necessary but **not sufficient**. Ollama's qwen3-coder
+template also drops the tool definitions once there is `tool` role history — so a run
+goes: step 1 structured `tool_calls`, step 2 `<function=write_file>` as plain text.
+
+Same deadly consequence: the loop sees no tool calls, calls it a final answer, and the
+model reports *"All files have been verified and are in place"* with an empty directory.
+
+`llm-agent` therefore **parses the text form too** (`recover_text_tool_calls`). A tool
+call the harness can see is a tool call that actually runs; anything the harness cannot
+see is fiction. Recovered calls are rewritten into the message as structured
+`tool_calls`, so the next prompt render carries a clean history.
+
+The parser is narrow — it requires a literal `<function=NAME>` block, so prose describing
+a function never trips it. Verified against the exact text qwen3-coder emitted, plus a
+no-false-positive case.
+
+**If you add a model, check this both ways.** Any model whose tool calls the harness
+can't parse will confidently lie about work it never did.
+
+## Room: Never ask — build
+
+A local model handed a one-line brief will often come back with a questionnaire. Two
+defences, both on by default:
+
+1. **The system prompt forbids it.** "NEVER ask a clarifying question… choose the most
+   reasonable interpretation, BUILD IT, and state the assumption in one line."
+2. **`--whip` catches it anyway.** The hook's work-turn test is "did it edit files",
+   which is correct for Claude Code but leaves a hole here: a run that asks a question
+   and edits nothing sails through as conversational. So `llm-agent` adds one forced
+   retry when a whipped run produced **no writes** *and* ended in a question. One strike,
+   then it goes through — same shape as the hook, cannot deadlock.
+
+The detector is a narrow phrase list ("could you provide", "what kind of", "let me know",
+"do you want", "shall I"…) so a normal report containing a question mark does not trip
+it. 7/7 on real phrasings.
+
+Measured: `"build the thing"` went from a 5-bullet questionnaire and zero files to a
+Flask app with tests, README, requirements and .gitignore.
+
+## Room: What it still gets wrong
+
+The whip makes a local model keep going. It does **not** make it correct.
+
+In that same run it wrote `test_app.py` asserting the home page returns `'Hello, World!'`,
+then — prompted by the whip to keep improving — changed the route to return
+`'Hello, World! Welcome to the Flask web application.'` and never updated the test. It
+also wrote `requirements.txt` without installing anything, so the test cannot even
+import.
+
+It then reported *"All files have been verified and are in place."* They were not
+verified. Nothing was run.
+
+**Treat local agent output as a draft that compiles-by-luck.** Run the tests yourself.
+The whip buys you volume and follow-through, not correctness.
+
 ## Room: Backends
 
 | Port | Backend | Notes |
