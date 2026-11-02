@@ -5,12 +5,25 @@ llama.cpp as the engine, and an agentic loop that reuses the same Claude Code ho
 govern Aiden's real sessions.
 
 ```bash
-llm ls                        every model, with size
+llm up                        ONE COMMAND — daemon up, model resident, ready
+llm agent "build X"           up, then the whipped agentic loop against it
+llm status                    what is running, what is holding memory
+llm down                      evict the model, free the wired RAM
+```
+
+Everything else:
+
+```bash
+llm ls                        every model, with size and architecture
 llm run qwen3-coder           interactive chat
-llm serve qwen3-coder         OpenAI API on localhost:8080/v1
-llm-agent --whip "build X"    agentic loop, refuses to finish early
+llm serve qwen3-coder         OpenAI API on localhost:8080/v1 (--jinja, tool calls on)
+llm-agent --whip "build X"    the loop directly, with full flags
 test-whip                     prove the hook wiring (5 cases)
 ```
+
+`llm up` is idempotent — run it twice and the second is a no-op in 0.2s. It starts
+`ollama serve` if it is down, pulls the model if missing, and pins it with a 1h
+`keep_alive`. `$LLM_AGENT_MODEL` overrides the default `qwen3-coder:30b`.
 
 ## One model store
 
@@ -99,6 +112,10 @@ about destructive commands and no human approves each one. Default closed.
 - **If this folder moves, four pointers break silently**: both store symlinks, `$LLM_STACK`
   in `~/.zshrc`, and every absolute link in `gguf/`. Re-point them and re-run `sync-gguf`
   in the same breath.
+- **A `dspark-*` GGUF is a draft model, not a model.** Arch `dflash` fails with
+  `dflash requires ctx_other to be set` and always will — it is the speculative-decoding
+  half of DeepSeek-V4-Flash and needs the (far larger) target alongside it via
+  `--spec-type draft-dspark`. `llm ls` shows architecture; check it before a 10 GB pull.
 - **`llama-cli` is chat-only** in b12034; one-shot generation is `llama-completion`.
 - **`-base` tags are not instruction-tuned** and will ramble at a chat prompt.
 
