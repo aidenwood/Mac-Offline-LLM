@@ -11,6 +11,10 @@ rm -rf "$OUT"
 mkdir -p "$OUT"
 
 # --- LM Studio / manually downloaded GGUFs -----------------------------------
+if [ ! -d "$ROOT/models" ]; then
+  echo "· models/ not found — skipping (expected if you only use ollama)"
+fi
+mkdir -p "$ROOT/models"
 while IFS= read -r -d '' f; do
   rel="${f#"$ROOT/models/"}"
   name="$(basename "$f")"

@@ -26,10 +26,19 @@ sys.argv = ["llm-agent", "noop"]           # module parses args only under __mai
 spec.loader.exec_module(agent)
 
 PASS, FAIL = "\033[32mPASS\033[0m", "\033[31mFAIL\033[0m"
+SKIP = "\033[33mSKIP\033[0m"
 results = []
+
+# The whip hook is OPTIONAL. Without it those cases are untestable, not failing —
+# reporting FAIL for a feature the user never installed is a guard crying wolf.
+HAVE_HOOK = agent.WHIP_AVAILABLE
 
 
 def case(name, armed, edits, elapsed_s, floor_min, expect_block):
+    if not HAVE_HOOK:
+        print(f"  {SKIP}  {name}")
+        print(f"        whip hook not installed at {agent.HOOK}")
+        return
     sid = f"test-{uuid.uuid4().hex[:8]}"
     os.environ["WHIP_MIN_WORK_SECONDS"] = str(floor_min * 60)
 
@@ -60,6 +69,10 @@ def case(name, armed, edits, elapsed_s, floor_min, expect_block):
 
 def strike_case():
     """Second stop in the same run must always be allowed — one-strike, never a cage."""
+    if not HAVE_HOOK:
+        print(f"  {SKIP}  one-strike only: 2nd stop always goes through")
+        print(f"        whip hook not installed at {agent.HOOK}")
+        return
     sid = f"test-{uuid.uuid4().hex[:8]}"
     os.environ["WHIP_MIN_WORK_SECONDS"] = "600"
     agent.hook("start", {"session_id": sid, "prompt": "whip it good"})
@@ -161,7 +174,9 @@ def trim_cases():
 
 
 print(f"hook: {agent.HOOK}")
-print(f"exists: {agent.HOOK.exists()}\n")
+print("exists: {}{}\n".format(
+    HAVE_HOOK,
+    "" if HAVE_HOOK else "   → whip cases will SKIP (optional feature)"))
 
 print("whip:")
 case("unarmed work run stays out of the way",   False, 3, 10,   45, False)
@@ -174,5 +189,6 @@ verify_cases()
 print()
 trim_cases()
 
-print(f"\n{sum(results)}/{len(results)} passed")
+skipped = "" if HAVE_HOOK else "  (whip cases skipped — hook not installed)"
+print(f"\n{sum(results)}/{len(results)} passed{skipped}")
 sys.exit(0 if all(results) else 1)

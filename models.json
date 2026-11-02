@@ -1,0 +1,159 @@
+{
+  "_comment": "Machine-readable model recommendations. Read by bin/llm-install and bin/llm-recommend. Edit this file, not the markdown \u2014 the docs quote it, so two copies would drift. Every row carries whether it was actually measured or merely extrapolated; saying 'verified' about an untested recommendation is how a tool stops being trustworthy.",
+  "generated": "2026-11-03",
+  "stale_after_days": 60,
+  "budget": {
+    "_comment": "Converts total RAM into a safe maximum on-disk model size. Best-effort heuristic, not a simulator \u2014 on a Compute error, step down a tier rather than trusting the arithmetic.",
+    "os_reserve_gb": 4,
+    "app_reserve_gb_idle": 2,
+    "app_reserve_gb_busy": 4,
+    "safety_margin_fraction": 0.15,
+    "kv_cache_gb_per_8k_ctx": 0.5,
+    "resident_overhead_factor": 1.15,
+    "worked_example": "36GB, IDE open, 8K ctx -> (36-4-4) - 5.4 - 0.5 = 22.1 ; /1.15 = 19.2 GB ceiling. Matches the measured fact that an 18GB model + 8K ctx still OOM'd here when other processes held wired memory."
+  },
+  "tiers": [
+    {
+      "min_ram_gb": 8,
+      "primary": "qwen2.5-coder:1.5b",
+      "fallback": "qwen2.5-coder:0.5b",
+      "disk_gb": 1.0,
+      "resident_gb": 1.5,
+      "agentic": false,
+      "note": "Chat and autocomplete only. Too small to hold a tool schema plus working context reliably \u2014 agentic loops will thrash.",
+      "verified": false,
+      "source": "extrapolated"
+    },
+    {
+      "min_ram_gb": 16,
+      "primary": "qwen2.5-coder:7b",
+      "fallback": "qwen2.5-coder:3b",
+      "disk_gb": 4.4,
+      "resident_gb": 6.0,
+      "agentic": "marginal",
+      "note": "Short, single-file tasks. No MoE headroom at this tier.",
+      "verified": false,
+      "source": "extrapolated"
+    },
+    {
+      "min_ram_gb": 24,
+      "primary": "gpt-oss:20b",
+      "fallback": "qwen2.5-coder:7b",
+      "disk_gb": 12.0,
+      "resident_gb": 14.0,
+      "agentic": true,
+      "note": "Tools + thinking. Modest context.",
+      "verified": false,
+      "source": "extrapolated"
+    },
+    {
+      "min_ram_gb": 32,
+      "primary": "gpt-oss:20b",
+      "fallback": "qwen3.6:27b",
+      "disk_gb": 12.0,
+      "resident_gb": 14.0,
+      "agentic": true,
+      "note": "qwen3-coder:30b fits on paper but leaves almost no headroom once a browser and IDE are open.",
+      "verified": false,
+      "source": "extrapolated"
+    },
+    {
+      "min_ram_gb": 36,
+      "primary": "qwen3-coder:30b",
+      "fallback": "gpt-oss:20b",
+      "disk_gb": 18.0,
+      "resident_gb": 21.0,
+      "agentic": true,
+      "note": "30B MoE, 3B active per token \u2014 30B knowledge at 3B speed. Measured on an M4 Max/36GB: loads, serves, and emits correct structured tool calls. Close to the ceiling: a second model or a forgotten llama-cli session will OOM it.",
+      "verified": true,
+      "source": "measured"
+    },
+    {
+      "min_ram_gb": 48,
+      "primary": "qwen3-coder:30b",
+      "fallback": "qwen3.6:27b",
+      "disk_gb": 18.0,
+      "resident_gb": 21.0,
+      "agentic": true,
+      "note": "Same pick as 36GB but with real headroom for longer context.",
+      "verified": false,
+      "source": "extrapolated"
+    },
+    {
+      "min_ram_gb": 64,
+      "primary": "qwen3-coder:30b",
+      "fallback": "mistral-small:24b",
+      "disk_gb": 18.0,
+      "resident_gb": 21.0,
+      "agentic": true,
+      "note": "Room for a much larger context window, or a second model resident alongside.",
+      "verified": false,
+      "source": "extrapolated"
+    },
+    {
+      "min_ram_gb": 96,
+      "primary": "gpt-oss:120b",
+      "fallback": "qwen3-coder:30b",
+      "disk_gb": 65.0,
+      "resident_gb": 75.0,
+      "agentic": true,
+      "note": "Extrapolated. Check disk before pulling \u2014 65GB is a serious download.",
+      "verified": false,
+      "source": "extrapolated"
+    },
+    {
+      "min_ram_gb": 128,
+      "primary": "gpt-oss:120b",
+      "fallback": "qwen3-coder:30b",
+      "disk_gb": 65.0,
+      "resident_gb": 75.0,
+      "agentic": true,
+      "note": "qwen3-coder:480b exists but at Q4 exceeds most SSDs. Not recommended without a deliberate disk plan.",
+      "verified": false,
+      "source": "extrapolated"
+    }
+  ],
+  "embedding": {
+    "default": "nomic-embed-text",
+    "disk_gb": 0.26,
+    "large": "qwen3-embedding",
+    "note": "Tiny. Pull alongside the primary if you want local RAG."
+  },
+  "known_bad": [
+    {
+      "tag": "deepseek-coder-v2:16b",
+      "tool_calls": "fail",
+      "verified": true,
+      "source": "measured",
+      "note": "ollama rejects it at the API: 'does not support tools' (HTTP 400). Through llama-server it is worse \u2014 it emits tool calls as template TEXT and then hallucinates the tool output, reporting success for files it never wrote. Chat only."
+    },
+    {
+      "tag": "qwen2.5-coder:1.5b-base",
+      "tool_calls": "fail",
+      "verified": true,
+      "source": "measured",
+      "note": "A -base tag is not instruction-tuned. It continues text rather than answering. Use the instruct/default tag."
+    },
+    {
+      "tag": "dspark-DeepSeek-V4-Flash",
+      "tool_calls": "untested",
+      "verified": true,
+      "source": "measured",
+      "note": "arch 'dflash' is a DSpark DRAFT model, not standalone. llama.cpp needs ctx_other, which b12034 does not expose. Only usable as the draft half of speculative decoding."
+    }
+  ],
+  "quantisation": {
+    "floor": "Q4_K_M",
+    "rule": "Quantise deeper to fit a BIGGER model; never deeper on the same model. A 30B at Q4_K_M beats a 14B at Q8. Below Q4, code specifically falls apart \u2014 one mangled bracket breaks the whole output, where prose would degrade gracefully.",
+    "prefer_moe": "A 30B-A3B activates 3B params per token: large-model knowledge at small-model speed, for the storage cost of the full model. On a memory-constrained Mac this beats a dense model of the same size."
+  },
+  "tool_calling_notes": {
+    "_comment": "Measured with bin/llm-probe-tools on 2026-11-03.",
+    "qwen3-coder:30b": {
+      "plain": "pass",
+      "with_system_message": "FAIL \u2014 emits a tool call as text",
+      "after_tool_history": "pass",
+      "note": "Only a system role breaks it: ollama's template injects the tool definitions into the system slot, so a user-supplied system message displaces them. An earlier reading blamed tool history as well; the probe shows that is wrong \u2014 tool history is fine. llm-agent folds the system prompt into the first user turn, which is the correct fix."
+    }
+  }
+}

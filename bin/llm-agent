@@ -3,14 +3,19 @@
 llm-agent — an agentic loop over a local llama.cpp server, optionally whipped.
 
 llama-server is a stateless completion API: no turns, no Stop event, nothing for a
-Claude Code hook to intercept. This supplies the missing piece — a loop that has a
-concept of "the model is trying to finish" — and then hands that moment to the EXACT
-SAME ~/.claude/hooks/whip-it-good.sh that governs Claude Code.
+Stop hook to intercept. This supplies the missing piece — a loop that has a concept
+of "the model is trying to finish" — and hands that moment to Claude Code's real
+whip-it-good.sh Stop hook if one is installed.
 
-The hook is not reimplemented or copied here. It is invoked with the same JSON
-contract (session_id + transcript_path, event "start" / "stop"), so there is one
-definition of the rule and sharpening it in one place sharpens it everywhere.
-See Aidxn-Context/halls/code-standards.md — never fork a source of truth.
+OPTIONAL. Without the hook everything else works; --whip prints a loud banner and
+the final report says WHIP WAS DISABLED. It is never silently skipped.
+
+The hook is invoked, never copied — same JSON contract (session_id +
+transcript_path, event "start"/"stop") — so one file defines the rule for both
+Claude Code and this loop. Override its location with $WHIP_HOOK.
+
+--rules loads markdown rule files from $LLM_AGENT_CONTEXT/halls/<name>.md. Unset by
+default; --rules without it is a hard error rather than a silent no-op.
 
 Usage
   llm-agent "task"                        plain agentic loop
@@ -44,8 +49,21 @@ import urllib.error
 import urllib.request
 import uuid
 
-HOOK = pathlib.Path.home() / ".claude" / "hooks" / "whip-it-good.sh"
-CONTEXT = pathlib.Path.home() / "Desktop" / "00 - Aidxn" / "Aidxn-Context"
+# ── Optional external integrations ─────────────────────────────────────────
+# Both are OPTIONAL and both are absent on a fresh machine. The rule here is
+# that a disabled feature must never look identical to a working one — an
+# earlier version returned None silently when the hook was missing, so --whip
+# ran, printed "whip on", enforced nothing, and warned nobody.
+
+# Claude Code's Stop hook. Override with $WHIP_HOOK to point somewhere else.
+HOOK = pathlib.Path(os.environ.get(
+    "WHIP_HOOK", pathlib.Path.home() / ".claude" / "hooks" / "whip-it-good.sh"))
+WHIP_AVAILABLE = HOOK.exists()
+
+# A directory of rule files to load via --rules. Unset by default: this is
+# personal context, not something the repo ships.
+_ctx = os.environ.get("LLM_AGENT_CONTEXT", "").strip()
+CONTEXT = pathlib.Path(_ctx).expanduser() if _ctx else None
 
 HALL_ALIASES = {
     "code": "code-standards",
@@ -89,9 +107,41 @@ class Transcript:
 
 # ───────────────────────────────── the hook ────────────────────────────────
 
+def whip_banner():
+    """Say loudly, once, that --whip was asked for and cannot be honoured."""
+    W = 72
+    # Pad by DISPLAY width, not len(): '!' is fine but an em-dash or a warning
+    # sign is double-width in a terminal and silently breaks a box drawn with
+    # str.ljust(). Keeping the box square is the whole point of a box.
+    import unicodedata
+
+    def disp(s):
+        return sum(2 if unicodedata.east_asian_width(c) in ("W", "F") else 1
+                   for c in s)
+
+    def row(s):
+        return "│ " + s + " " * max(W - 1 - disp(s), 0) + "│"
+
+    lines = [
+        "⚠  WHIP REQUESTED BUT DISABLED",
+        "",
+        "The Whip-It-Good hook was not found at:",
+        "  {}".format(HOOK),
+        "",
+        "--whip will NOT be enforced. This run stops at the first 'done'.",
+        "",
+        "The hook ships with Claude Code. It is optional - everything else",
+        "works without it. Set $WHIP_HOOK if yours lives somewhere else.",
+    ]
+    print("\n┌" + "─" * W + "┐", file=sys.stderr)
+    for ln in lines:
+        print(row(ln), file=sys.stderr)
+    print("└" + "─" * W + "┘\n", file=sys.stderr)
+
+
 def hook(event, payload):
-    """Call the real whip-it-good.sh. Returns its block reason, or None."""
-    if not HOOK.exists():
+    """Call the whip-it-good.sh Stop hook. Returns its block reason, or None."""
+    if not WHIP_AVAILABLE:
         return None
     try:
         p = subprocess.run(
@@ -285,8 +335,8 @@ def run_tool(name, args, workdir, yolo, transcript, unrestricted=False):
             cmd = args["command"]
             if CATASTROPHIC.search(cmd):
                 return ("REFUSED: that command destroys the machine, not the session. "
-                        "Refused even under --yolo. If you genuinely need it, Aiden "
-                        "runs it himself.")
+                        "Refused even under --yolo. If you genuinely need it, the "
+                        "operator runs it manually.")
             if not yolo and not SAFE_BASH.match(cmd):
                 return ("REFUSED: not on the read-only allowlist. Re-run llm-agent "
                         "with --yolo to permit arbitrary shell, or use read_file / "
@@ -303,9 +353,10 @@ def run_tool(name, args, workdir, yolo, transcript, unrestricted=False):
 # ───────────────────────────── system prompt ───────────────────────────────
 
 BUILD_NOW = (
-    "You are a coding agent working on Aiden Wood's machine.\n\n"
-    "NEVER ask a clarifying question. Aiden briefs in one short line and expects a "
-    "working V1, not a questionnaire. If the task is underspecified, choose the most "
+    "You are a coding agent running locally on this machine.\n\n"
+    "NEVER ask a clarifying question. The operator briefs in one short line and "
+    "expects a working V1, not a questionnaire. If the task is underspecified, "
+    "choose the most "
     "reasonable interpretation, BUILD IT, and state the assumption you made in one "
     "line at the end.\n\n"
     "Use the tools. Do not describe what you would do — do it. A response that "
@@ -318,14 +369,34 @@ BUILD_NOW = (
 
 def system_prompt(rules):
     parts = [BUILD_NOW]
-    if rules:
-        for key in rules:
-            name = HALL_ALIASES.get(key.strip(), key.strip())
-            f = CONTEXT / "halls" / f"{name}.md"
-            if f.exists():
-                parts.append(f"\n\n# RULES — {name}\n\n{f.read_text()}")
-            else:
-                print(f"  ! no hall '{name}' — skipping", file=sys.stderr)
+    if not rules:
+        return "".join(parts)
+
+    # --rules asked for specific rule files. If the context dir isn't configured
+    # at all, that is a setup error, not something to shrug off — loading no
+    # rules while reporting success is how an agent quietly stops obeying them.
+    if CONTEXT is None:
+        sys.exit(
+            "--rules was given but $LLM_AGENT_CONTEXT is not set.\n"
+            "Point it at a directory containing halls/<name>.md, e.g.\n"
+            "  export LLM_AGENT_CONTEXT=~/my-rules\n"
+            "…or drop --rules to run without them.")
+    if not (CONTEXT / "halls").is_dir():
+        sys.exit(f"$LLM_AGENT_CONTEXT is set to {CONTEXT}, but {CONTEXT}/halls "
+                 "does not exist. Nothing to load.")
+
+    missing = []
+    for key in rules:
+        name = HALL_ALIASES.get(key.strip(), key.strip())
+        f = CONTEXT / "halls" / f"{name}.md"
+        if f.exists():
+            parts.append(f"\n\n# RULES — {name}\n\n{f.read_text()}")
+        else:
+            missing.append(name)
+    if missing:
+        avail = sorted(p.stem for p in (CONTEXT / "halls").glob("*.md"))
+        sys.exit(f"no such rule file(s): {', '.join(missing)}\n"
+                 f"available in {CONTEXT / 'halls'}: {', '.join(avail) or '(none)'}")
     return "".join(parts)
 
 
@@ -441,8 +512,12 @@ def main():
 
     env_note = ""
     if a.whip:
-        os.environ["WHIP_MIN_WORK_SECONDS"] = str(a.whip_minutes * 60)
-        env_note = f"  [whipped: {a.whip_minutes} min floor]"
+        if WHIP_AVAILABLE:
+            os.environ["WHIP_MIN_WORK_SECONDS"] = str(a.whip_minutes * 60)
+            env_note = f"  [whipped: {a.whip_minutes} min floor]"
+        else:
+            whip_banner()
+            env_note = "  [WHIP DISABLED — hook missing]"
     print(f"session {sid}  workdir {workdir}{env_note}", file=sys.stderr)
 
     rules = [r for r in a.rules.split(",") if r.strip()]
@@ -535,7 +610,8 @@ def run_turn(a, messages, state):
                 question_strike[0] = True
                 reason = (
                     "You ended without building anything and asked a question instead. "
-                    "Do not ask — Aiden briefs in one line and expects a working V1.\n\n"
+                    "Do not ask — the operator briefs in one line and expects a "
+                    "working V1.\n\n"
                     "Pick the most reasonable interpretation of the task, BUILD IT with "
                     "the tools now, and state your assumption in one line at the end."
                 )
@@ -572,7 +648,9 @@ def run_turn(a, messages, state):
             continue
 
         print(msg.get("content") or "(no output)")
-        tail = f"[{step + 1} steps, {strikes} whip strike(s)"
+        whip_note = (" whip strike(s)" if WHIP_AVAILABLE or not a.whip
+                     else " whip strike(s) — WHIP WAS DISABLED (hook missing)")
+        tail = f"[{step + 1} steps, {strikes}{whip_note}"
         if a.verify:
             ok, label, _ = run_verification(state["workdir"])
             tail += (f", {label}: {'PASS' if ok else 'FAIL'}" if label

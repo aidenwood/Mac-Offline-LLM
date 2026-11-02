@@ -49,9 +49,12 @@ Two details make it work against the unmodified hook:
 that lives in the one hook file. If the heuristics get sharpened there, the local agent
 inherits it for free.
 
-A reimplementation would be a second definition that drifts — see
-`Aidxn-Context/halls/code-standards.md`. The whole reason the hook exists is that a rule
-stated in two places stops being a rule.
+A reimplementation would be a second definition that drifts. The whole reason the hook
+exists is that a rule stated in two places stops being a rule.
+
+**And it must never fail quietly.** Without the hook, `--whip` prints a boxed banner and
+the final report says `WHIP WAS DISABLED`. The first version returned `None` silently, so
+the feature became decoration on every machine without Claude Code.
 
 ## Room: Usage
 
@@ -116,8 +119,8 @@ why the model stopped behaving. `/tokens` shows where you are.
 `--yolo` lifts the bash allowlist. `--unrestricted` lifts the `--workdir` write
 confinement. Together they give a local model your shell.
 
-**That is a real risk and it is Aiden's to take** — it is his machine. But one list is
-refused regardless:
+**That is a real risk, and it is the operator's to take** — it is their machine. But one
+list is refused regardless:
 
 ```
 rm -rf / | rm -rf ~ | sudo rm        mkfs | diskutil erase/reformat/partition

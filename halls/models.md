@@ -41,6 +41,13 @@ rambles and looks broken. It is not broken; it is the wrong tag.
 
 Use default/instruct tags for anything conversational or agentic.
 
+## Room: models.json is the source of truth
+
+The table above is generated from `../models.json`. Edit the JSON, not the
+markdown — two copies drift, and the scripts read the JSON. Every row carries
+`verified` and `source` (measured / extrapolated / vendor-card), and anything
+older than `stale_after_days` makes the tools say so.
+
 ## Room: Adding a model
 
 ```bash
@@ -63,7 +70,8 @@ for real parameter counts and sizes. Both findings above — GLM-5.3's true size
 DeepSeek tool-calling failure — came from primary sources and direct measurement, and both
 contradicted the blog consensus.
 
-See `Aidxn-Context/halls/research-standards.md`.
+Both findings came from primary sources and direct measurement, and both
+contradicted the blog consensus.
 
 ## Room: `dspark-*` / arch `dflash` is a DRAFT model, not a model
 

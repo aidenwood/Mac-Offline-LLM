@@ -1,0 +1,277 @@
+#!/usr/bin/env bash
+# llm-install — set this machine up to run an offline LLM, in one command.
+#
+#   llm install                 do it
+#   llm install --dry-run       decide everything, change nothing
+#   llm install --model <tag>   override the recommendation
+#   llm install --yes           don't stop to ask (CI, scripted setups)
+#   llm install --uninstall     remove the PATH wiring this put in place
+#
+# Bash, not Python, deliberately: this has to run before any question about
+# which python3 you have can be answered. Stock macOS ships 3.9.6 and PATH
+# order decides whether you get that or a brew build.
+#
+# Nothing here is destructive without saying so first. The only things it
+# writes outside its own directory are a symlink in brew's bin, and — only if
+# that isn't writable — a clearly marked block in your shell rc that
+# --uninstall removes exactly.
+set -uo pipefail
+
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+DRY=0; YES=0; UNINSTALL=0; FORCE=0; MODEL=""
+MARK_BEGIN="# >>> mac-offline-llm >>>"
+MARK_END="# <<< mac-offline-llm <<<"
+
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --dry-run)   DRY=1 ;;
+    --yes|-y)    YES=1 ;;
+    --force)     FORCE=1 ;;
+    --uninstall) UNINSTALL=1 ;;
+    --model)     MODEL="${2:-}"; shift ;;
+    -h|--help)   sed -n '2,20p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+    *)           echo "unknown option: $1" >&2; exit 2 ;;
+  esac
+  shift
+done
+
+ok()   { printf "  \033[32m✓\033[0m %s\n" "$*"; }
+warn() { printf "  \033[33m⚠\033[0m %s\n" "$*"; }
+bad()  { printf "  \033[31m✗\033[0m %s\n" "$*"; }
+step() { printf "\n\033[1m%s\033[0m\n" "$*"; }
+die()  { bad "$*"; exit 1; }
+run()  { if [ "$DRY" = 1 ]; then printf "      would run: %s\n" "$*"; else "$@"; fi; }
+
+ask() {   # ask "question" ; 0 = yes
+  [ "$YES" = 1 ] && return 0
+  [ "$DRY" = 1 ] && return 0
+  [ -t 0 ] || return 1          # non-interactive and no --yes: decline
+  printf "      %s [y/N] " "$1"
+  read -r reply </dev/tty
+  case "$reply" in [yY]*) return 0 ;; *) return 1 ;; esac
+}
+
+# ── uninstall ──────────────────────────────────────────────────────────────
+if [ "$UNINSTALL" = 1 ]; then
+  step "Removing PATH wiring"
+  if command -v brew >/dev/null 2>&1; then
+    link="$(brew --prefix)/bin/llm"
+    if [ -L "$link" ]; then rm -f "$link"; ok "removed symlink $link"; fi
+  fi
+  for rc in "$HOME/.zshrc" "$HOME/.bashrc" "$HOME/.bash_profile"; do
+    if [ -f "$rc" ] && grep -qF "$MARK_BEGIN" "$rc"; then
+      tmp="$(mktemp)"
+      sed "/$(printf '%s' "$MARK_BEGIN" | sed 's/[]\/$*.^[]/\\&/g')/,/$(printf '%s' "$MARK_END" | sed 's/[]\/$*.^[]/\\&/g')/d" "$rc" > "$tmp"
+      mv "$tmp" "$rc"
+      ok "removed the marked block from $rc"
+    fi
+  done
+  echo
+  echo "Models and ollama were left alone — remove those yourself if you want:"
+  echo "  ollama rm <tag>     ·     brew uninstall ollama llama.cpp"
+  exit 0
+fi
+
+echo
+echo "  Mac-Offline-LLM installer"
+[ "$DRY" = 1 ] && echo "  DRY RUN — nothing will be installed or changed"
+
+# ── 1. platform gate ───────────────────────────────────────────────────────
+step "1. Platform"
+[ "$(uname -s)" = "Darwin" ] || die "macOS required (found $(uname -s)). Nothing changed."
+if [ "$(sysctl -n hw.optional.arm64 2>/dev/null || echo 0)" != "1" ]; then
+  bad "Apple Silicon required."
+  echo "      Found: $(sysctl -n machdep.cpu.brand_string 2>/dev/null || echo unknown)"
+  echo "      Intel Macs have no unified memory and no usable Metal backend here."
+  echo "      Nothing was installed or changed."
+  exit 2
+fi
+ok "$(sysctl -n machdep.cpu.brand_string), macOS $(sw_vers -productVersion)"
+
+# ── 2-3. detect + recommend ────────────────────────────────────────────────
+step "2. This machine"
+"$ROOT/bin/llm-recommend" || true
+
+REC="$("$ROOT/bin/llm-recommend" --json 2>/dev/null)"
+[ -n "$REC" ] || die "could not read a recommendation"
+
+jq_get() { printf '%s' "$REC" | python3 -c "import json,sys;d=json.load(sys.stdin);print($1)" 2>/dev/null; }
+
+[ -n "$MODEL" ] || MODEL="$(jq_get 'd["recommendation"]["primary"]')"
+DISK_OK="$(jq_get 'd.get("disk_ok", True)')"
+NEED_GB="$(jq_get 'round(d["recommendation"]["disk_gb"]*1.5,1)')"
+
+[ -n "$MODEL" ] || die "no model could be chosen for this machine"
+
+step "3. Model"
+ok "will use: $MODEL"
+
+# Already pulled? Then there is nothing to download and the disk gate is moot.
+# Checking it anyway refuses to proceed on a machine that is already working,
+# which is the kind of false alarm that teaches people to pass --force reflexively.
+ALREADY=0
+if command -v ollama >/dev/null 2>&1 \
+   && ollama list 2>/dev/null | awk '{print $1}' | grep -qx "$MODEL"; then
+  ALREADY=1
+  ok "already downloaded — no disk space needed"
+fi
+
+if [ "$ALREADY" = 0 ] && [ "$DISK_OK" != "True" ] && [ "$FORCE" != 1 ]; then
+  bad "not enough free disk (need ~${NEED_GB} GB)."
+  echo "      ollama assembles the download, so usage roughly doubles mid-pull."
+  echo "      Free some space, pick a smaller model with --model <tag>,"
+  echo "      or re-run with --force to try anyway."
+  exit 1
+fi
+
+# ── 4. homebrew ────────────────────────────────────────────────────────────
+step "4. Homebrew"
+if command -v brew >/dev/null 2>&1; then
+  ok "present at $(command -v brew)"
+else
+  warn "not installed. It is the least painful way to get ollama and llama.cpp."
+  echo "      Install it yourself with the command from https://brew.sh, then re-run."
+  echo "      (This installer will not pipe a remote script into your shell for you.)"
+  if ask "Open brew.sh in your browser?"; then run open "https://brew.sh"; fi
+  exit 1
+fi
+
+# ── 5. ollama ──────────────────────────────────────────────────────────────
+step "5. ollama"
+if command -v ollama >/dev/null 2>&1; then
+  ok "present — $(ollama --version 2>/dev/null | head -1)"
+else
+  warn "not installed"
+  if ask "Install ollama via Homebrew?"; then
+    run brew install ollama || die "brew install ollama failed"
+    ok "installed"
+  else
+    die "ollama is required. Nothing else was changed."
+  fi
+fi
+
+if [ "$DRY" != 1 ]; then
+  if ! curl -sf --max-time 2 http://127.0.0.1:11434/api/tags >/dev/null 2>&1; then
+    nohup ollama serve >/tmp/ollama-serve.log 2>&1 &
+    for _ in $(seq 1 40); do
+      curl -sf --max-time 2 http://127.0.0.1:11434/api/tags >/dev/null 2>&1 && break
+      sleep 0.5
+    done
+  fi
+  curl -sf --max-time 2 http://127.0.0.1:11434/api/tags >/dev/null 2>&1 \
+    && ok "serving on :11434" || warn "could not reach :11434 — see /tmp/ollama-serve.log"
+fi
+
+# ── 6. llama.cpp (optional) ────────────────────────────────────────────────
+step "6. llama.cpp"
+if command -v llama-cli >/dev/null 2>&1; then
+  ok "present at $(command -v llama-cli)"
+else
+  warn "not installed — only needed for 'llm run/ask/serve/bench'."
+  echo "      'llm chat' and 'llm agent' go through ollama and work without it."
+  if ask "Install llama.cpp via Homebrew?"; then
+    run brew install llama.cpp && ok "installed" || warn "install failed — continuing"
+  fi
+fi
+
+# ── 7. pull ────────────────────────────────────────────────────────────────
+step "7. Model download"
+if [ "$DRY" = 1 ]; then
+  echo "      would run: ollama pull $MODEL"
+elif [ "$ALREADY" = 1 ]; then
+  ok "$MODEL already present"
+else
+  echo "      pulling $MODEL — this is a large download."
+  ollama pull "$MODEL" || die "pull failed"
+  ok "pulled"
+fi
+
+# ── 8. tool-calling probe ──────────────────────────────────────────────────
+step "8. Tool-calling check"
+if [ "$DRY" = 1 ]; then
+  echo "      would run: llm-probe-tools $MODEL"
+else
+  if "$ROOT/bin/llm-probe-tools" "$MODEL"; then
+    ok "$MODEL emits real structured tool calls — agentic use is safe"
+  else
+    warn "$MODEL did NOT pass the tool-calling probe."
+    echo "      It will still chat, but an agentic loop over it can report"
+    echo "      success for work it never did. See halls/agentic.md."
+  fi
+fi
+
+# ── 9. PATH ────────────────────────────────────────────────────────────────
+step "9. PATH"
+BREW_BIN="$(brew --prefix)/bin"
+LINK="$BREW_BIN/llm"
+if [ -L "$LINK" ] && [ "$(readlink "$LINK")" = "$ROOT/bin/llm" ]; then
+  ok "already linked: $LINK"
+elif [ -w "$BREW_BIN" ]; then
+  run ln -sfn "$ROOT/bin/llm" "$LINK"
+  ok "linked $LINK → $ROOT/bin/llm   (remove with: llm install --uninstall)"
+else
+  warn "$BREW_BIN is not writable — falling back to your shell rc."
+  RC="$HOME/.zshrc"; [ "${SHELL##*/}" = "bash" ] && RC="$HOME/.bashrc"
+  if [ -f "$RC" ] && grep -qF "$MARK_BEGIN" "$RC"; then
+    ok "already wired in $RC"
+  else
+    echo "      This block would be appended to $RC:"
+    echo
+    echo "        $MARK_BEGIN"
+    echo "        export PATH=\"$ROOT/bin:\$PATH\""
+    echo "        $MARK_END"
+    echo
+    if ask "Append it?"; then
+      if [ "$DRY" != 1 ]; then
+        { echo ""; echo "$MARK_BEGIN"; echo "export PATH=\"$ROOT/bin:\$PATH\""
+          echo "$MARK_END"; } >> "$RC"
+      fi
+      ok "appended to $RC — open a new terminal, or: source $RC"
+    else
+      warn "skipped. Run commands as $ROOT/bin/llm"
+    fi
+  fi
+fi
+
+# ── 10. smoke test ─────────────────────────────────────────────────────────
+step "10. Smoke test"
+if [ "$DRY" = 1 ]; then
+  echo "      would ask the model one question to prove the stack answers"
+else
+  reply="$(curl -sf --max-time 180 http://127.0.0.1:11434/v1/chat/completions \
+    -H 'Content-Type: application/json' \
+    -d "{\"model\":\"$MODEL\",\"messages\":[{\"role\":\"user\",\"content\":\"reply with the single word: ready\"}],\"max_tokens\":10}" \
+    | python3 -c 'import json,sys;print(json.load(sys.stdin)["choices"][0]["message"]["content"].strip())' 2>/dev/null)"
+  if [ -n "$reply" ]; then ok "model answered: \"$reply\""
+  else bad "the model did not answer — the stack is not working yet"; fi
+fi
+
+# ── 11. optional integrations ──────────────────────────────────────────────
+step "11. Optional extras"
+HOOKPATH="${WHIP_HOOK:-$HOME/.claude/hooks/whip-it-good.sh}"
+if [ -f "$HOOKPATH" ]; then
+  ok "Whip-It-Good hook found — 'llm agent --whip' will be enforced"
+else
+  warn "no Whip-It-Good hook at $HOOKPATH"
+  echo "      --whip will print a banner and NOT be enforced. It is optional;"
+  echo "      the hook ships with Claude Code. Set \$WHIP_HOOK if yours lives"
+  echo "      elsewhere. Everything else works without it."
+fi
+if [ -n "${LLM_AGENT_CONTEXT:-}" ]; then
+  ok "rule files: \$LLM_AGENT_CONTEXT=$LLM_AGENT_CONTEXT"
+else
+  warn "\$LLM_AGENT_CONTEXT unset — '--rules' is unavailable (optional)"
+fi
+
+# ── done ───────────────────────────────────────────────────────────────────
+step "Done"
+cat <<EOF
+  llm chat                      long-running session, full shell
+  llm agent "build X"           one-shot agentic run
+  llm status                    what is running and holding memory
+  llm down                      free the memory when you are finished
+
+  model: $MODEL
+EOF
+[ "$DRY" = 1 ] && echo "  (dry run — nothing above actually happened)"
+echo

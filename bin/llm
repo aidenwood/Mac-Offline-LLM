@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 # llm — thin wrapper over llama.cpp + ollama, pointed at the Aidxn model store.
 #
-#   llm up [tag]                 ONE COMMAND: daemon up, model resident, ready to work
+#   llm install                  FIRST RUN: detect hardware, install deps, pull a model
+#   llm up [tag]                 daemon up, model resident, ready to work
 #   llm agent "task"             up, then run the whipped agentic loop against it
 #   llm chat                     up, then a long-running session: full shell, writes anywhere
 #   llm status                   what is running and what is holding memory
@@ -15,9 +16,28 @@
 #
 # <match> is any substring of a filename in gguf/ (e.g. "coder-v2").
 set -euo pipefail
+shopt -s nullglob
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-BIN="$ROOT/llama.cpp"
+# llama.cpp binaries: a local checkout wins, else whatever is on PATH (brew).
+# Resolved lazily so `llm up/agent/chat` (which only need ollama) work without them.
+if [ -d "$ROOT/llama.cpp" ]; then
+  BIN="$ROOT/llama.cpp"
+elif command -v llama-cli >/dev/null 2>&1; then
+  BIN="$(dirname "$(command -v llama-cli)")"
+else
+  BIN=""
+fi
+
+need_llamacpp() {
+  [ -n "$BIN" ] && return 0
+  die "llama.cpp is not installed.
+
+  brew install llama.cpp
+
+…or run 'llm install', which does it for you. Only 'llm run/ask/serve/bench'
+need it — 'llm up', 'llm agent' and 'llm chat' go through ollama and work now."
+}
 GGUF="$ROOT/gguf"
 OLLAMA="http://127.0.0.1:11434"
 AGENT_MODEL="${LLM_AGENT_MODEL:-qwen3-coder:30b}"
@@ -97,6 +117,8 @@ bring_up() {
 cmd="${1:-ls}"; shift || true
 
 case "$cmd" in
+  install) exec "$ROOT/bin/llm-install" "$@" ;;
+
   up)     bring_up "${1:-$AGENT_MODEL}" ;;
 
   agent)  bring_up "$AGENT_MODEL" >&2
@@ -126,18 +148,27 @@ case "$cmd" in
           done < <(resident)
           echo "✓ memory freed" ;;
 
-  ls)     for f in "$GGUF"/*.gguf; do
+  ls)     found=0
+          for f in "$GGUF"/*.gguf; do
+            found=1
             printf "%-45s %8s  %s\n" "$(basename "$f")" \
               "$(du -Lh "$f" | cut -f1)" "$("$ROOT/bin/gguf-arch" "$f")"
-          done ;;
+          done
+          [ "$found" -eq 1 ] || cat <<'EOF'
+no models yet.
 
-  run)    m=$(resolve "$1"); shift; warn_wired
+  llm install         detect this machine and pull the right model
+  ollama pull <tag>   pull a specific one, then: sync-gguf
+EOF
+          ;;
+
+  run)    need_llamacpp; m=$(resolve "$1"); shift; warn_wired
           exec "$BIN/llama-cli"        -m "$m" -ngl 999 -c 8192 "$@" ;;
-  ask)    m=$(resolve "$1"); shift; p="$1"; shift || true; warn_wired
+  ask)    need_llamacpp; m=$(resolve "$1"); shift; p="$1"; shift || true; warn_wired
           exec "$BIN/llama-completion" -m "$m" -ngl 999 -c 8192 -no-cnv -p "$p" "$@" ;;
-  serve)  m=$(resolve "$1"); shift; warn_wired
+  serve)  need_llamacpp; m=$(resolve "$1"); shift; warn_wired
           exec "$BIN/llama-server"     -m "$m" -ngl 999 -c 8192 --jinja \
                                        --port "${LLM_PORT:-8080}" "$@" ;;
-  bench)  m=$(resolve "$1"); shift; exec "$BIN/llama-bench"  -m "$m" "$@" ;;
-  *)      exec "$BIN/llama-$cmd" "$@" ;;
+  bench)  need_llamacpp; m=$(resolve "$1"); shift; exec "$BIN/llama-bench" -m "$m" "$@" ;;
+  *)      need_llamacpp; exec "$BIN/llama-$cmd" "$@" ;;
 esac

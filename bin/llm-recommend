@@ -1,0 +1,270 @@
+#!/usr/bin/env python3
+"""
+llm-recommend — detect this Mac and say which local model actually fits.
+
+Read-only. Installs nothing, downloads nothing. `llm install` calls it, and so
+will the GUI, which is why it can emit JSON.
+
+  llm-recommend              human-readable report
+  llm-recommend --json       machine-readable, for the app
+  llm-recommend --quiet      just the model tag, for scripts
+
+Python 3.9 compatible: stock macOS ships 3.9.6 and PATH order decides whether
+you get that or a newer brew build. No 3.10+ syntax here.
+"""
+
+import argparse
+import json
+import os
+import pathlib
+import re
+import shutil
+import subprocess
+import sys
+import time
+
+ROOT = pathlib.Path(__file__).resolve().parent.parent
+MODELS_JSON = ROOT / "models.json"
+GB = 1024 ** 3
+
+
+# ───────────────────────────── detection ───────────────────────────────────
+
+def sysctl(key):
+    try:
+        out = subprocess.run(["sysctl", "-n", key], capture_output=True,
+                             text=True, timeout=5)
+        return out.stdout.strip() if out.returncode == 0 else None
+    except Exception:
+        return None
+
+
+def detect():
+    """Facts about this machine. Every value may be None — callers must cope."""
+    mem = sysctl("hw.memsize")
+    pagesize = sysctl("hw.pagesize")          # 16384 on Apple Silicon, 4096 Intel
+    chip = sysctl("machdep.cpu.brand_string") or "unknown"
+    arm = sysctl("hw.optional.arm64") == "1"
+
+    d = {
+        "os": "macOS" if sys.platform == "darwin" else sys.platform,
+        "os_version": None,
+        "chip": chip,
+        "apple_silicon": arm,
+        "ram_gb": round(int(mem) / GB, 1) if mem else None,
+        "page_size": int(pagesize) if pagesize else None,
+        "available_gb": None,
+        "disk_free_gb": None,
+        "ollama": shutil.which("ollama"),
+        "brew": shutil.which("brew"),
+        "llama_cpp": shutil.which("llama-cli"),
+        "busy": False,
+    }
+
+    try:
+        sw = subprocess.run(["sw_vers", "-productVersion"], capture_output=True,
+                            text=True, timeout=5)
+        d["os_version"] = sw.stdout.strip() or None
+    except Exception:
+        pass
+
+    # Currently-reclaimable memory. Secondary signal only — it swings constantly,
+    # and wired pages never come back. Total RAM is the real gate.
+    if d["page_size"]:
+        try:
+            vm = subprocess.run(["vm_stat"], capture_output=True, text=True, timeout=5)
+            pages = dict(re.findall(r"^(.+?):\s+(\d+)\.", vm.stdout, re.M))
+            free = sum(int(pages.get(k, 0)) for k in
+                       ("Pages free", "Pages inactive", "Pages speculative"))
+            d["available_gb"] = round(free * d["page_size"] / GB, 1)
+        except Exception:
+            pass
+
+    # Where ollama will actually write.
+    target = pathlib.Path.home() / ".ollama" / "models"
+    probe = target if target.exists() else pathlib.Path.home()
+    try:
+        d["disk_free_gb"] = round(shutil.disk_usage(probe).free / GB, 1)
+    except Exception:
+        pass
+
+    # An IDE or browser open means less headroom. Cheap check, better than a guess.
+    try:
+        ps = subprocess.run(["pgrep", "-l", "-f",
+                             "Visual Studio Code|Google Chrome|Safari|Arc|Firefox|Xcode"],
+                            capture_output=True, text=True, timeout=5)
+        d["busy"] = bool(ps.stdout.strip())
+    except Exception:
+        pass
+
+    return d
+
+
+# ───────────────────────────── recommendation ──────────────────────────────
+
+def load_models():
+    if not MODELS_JSON.exists():
+        sys.exit("models.json not found at " + str(MODELS_JSON))
+    return json.loads(MODELS_JSON.read_text())
+
+
+def budget_gb(ram_gb, busy, cfg, ctx_k=8):
+    """Safe maximum on-disk model size for this much RAM. Heuristic, not gospel."""
+    usable = ram_gb - cfg["os_reserve_gb"] - (
+        cfg["app_reserve_gb_busy"] if busy else cfg["app_reserve_gb_idle"])
+    usable -= cfg["safety_margin_fraction"] * ram_gb
+    usable -= cfg["kv_cache_gb_per_8k_ctx"] * (ctx_k / 8.0)
+    return round(max(usable, 0) / cfg["resident_overhead_factor"], 1)
+
+
+def pick(ram_gb, busy, data):
+    """Highest tier this machine clears, plus the headroom calculation."""
+    tiers = sorted(data["tiers"], key=lambda t: t["min_ram_gb"])
+    chosen = tiers[0]
+    for t in tiers:
+        if ram_gb >= t["min_ram_gb"] - 0.5:     # 36.0 vs a 36 tier, float slop
+            chosen = t
+    budget = budget_gb(ram_gb, busy, data["budget"])
+
+    # If the tier's model exceeds the computed budget, step down. The table is a
+    # starting point; the arithmetic knows about the browser you left open.
+    if chosen["disk_gb"] > budget:
+        for t in reversed(tiers):
+            if t["disk_gb"] <= budget:
+                return t, budget, chosen
+    return chosen, budget, None
+
+
+def stale_days(data):
+    try:
+        gen = time.strptime(data["generated"], "%Y-%m-%d")
+        return int((time.time() - time.mktime(gen)) / 86400)
+    except Exception:
+        return 0
+
+
+# ───────────────────────────── output ──────────────────────────────────────
+
+def report(d, data):
+    if not d["apple_silicon"]:
+        print("✗ Apple Silicon required.")
+        print("  Detected: " + d["chip"])
+        print("  Intel Macs have no unified memory and no Metal backend worth")
+        print("  using for this. Nothing was installed or changed.")
+        return 2
+
+    if not d["ram_gb"]:
+        print("✗ could not read hw.memsize — cannot size a model safely.")
+        return 1
+
+    tier, budget, downgraded = pick(d["ram_gb"], d["busy"], data)
+    age = stale_days(data)
+
+    print("  machine   {}  ·  {} GB RAM  ·  macOS {}".format(
+        d["chip"], d["ram_gb"], d["os_version"] or "?"))
+    if d["available_gb"] is not None:
+        print("  memory    {} GB reclaimable right now{}".format(
+            d["available_gb"], "  (IDE/browser open)" if d["busy"] else ""))
+    print("  disk      {} GB free where ollama writes".format(
+        d["disk_free_gb"] if d["disk_free_gb"] is not None else "?"))
+    print("  budget    {} GB max model size for this box".format(budget))
+    print()
+
+    src = "measured on this hardware" if tier["verified"] else "EXTRAPOLATED, not tested"
+    print("  → {}".format(tier["primary"]))
+    print("    {} GB on disk, ~{} GB resident   [{}]".format(
+        tier["disk_gb"], tier["resident_gb"], src))
+    print("    fallback: {}".format(tier["fallback"]))
+    if tier.get("note"):
+        for line in _wrap(tier["note"], 68):
+            print("    " + line)
+
+    if downgraded:
+        print()
+        print("  ⚠ stepped down from {} — it needs {} GB but the budget is {} GB.".format(
+            downgraded["primary"], downgraded["disk_gb"], budget))
+        print("    Close an IDE or browser and re-run to get the bigger model.")
+
+    if tier["agentic"] is False:
+        print()
+        print("  ⚠ agentic coding is not realistically viable at this RAM tier.")
+        print("    Chat and autocomplete will work; tool-calling loops will thrash.")
+    elif tier["agentic"] == "marginal":
+        print()
+        print("  ⚠ agentic work is marginal here — short single-file tasks only.")
+
+    if d["disk_free_gb"] is not None:
+        need = tier["disk_gb"] * 1.5
+        if d["disk_free_gb"] < need:
+            print()
+            print("  ✗ not enough disk: need ~{} GB free (ollama assembles the".format(
+                round(need, 1)))
+            print("    download, so usage roughly doubles mid-pull), have {} GB.".format(
+                d["disk_free_gb"]))
+
+    print()
+    print("  tooling   ollama {}  ·  brew {}  ·  llama.cpp {}".format(
+        "✓" if d["ollama"] else "missing",
+        "✓" if d["brew"] else "missing",
+        "✓" if d["llama_cpp"] else "missing"))
+
+    if age > data.get("stale_after_days", 60):
+        print()
+        print("  ⚠ these recommendations are {} weeks old ({}). Model releases".format(
+            age // 7, data["generated"]))
+        print("    move fast — check models.json against the ollama library.")
+    return 0
+
+
+def _wrap(text, width):
+    words, line, out = text.split(), "", []
+    for w in words:
+        if len(line) + len(w) + 1 > width:
+            out.append(line)
+            line = w
+        else:
+            line = (line + " " + w).strip()
+    if line:
+        out.append(line)
+    return out
+
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--json", action="store_true", help="machine-readable output")
+    ap.add_argument("--quiet", action="store_true", help="print only the model tag")
+    ap.add_argument("--ctx", type=int, default=8, help="planned context in K (default 8)")
+    a = ap.parse_args()
+
+    d = detect()
+    data = load_models()
+
+    if a.json:
+        out = {"hardware": d, "generated": data["generated"],
+               "stale_days": stale_days(data)}
+        if d["apple_silicon"] and d["ram_gb"]:
+            tier, budget, downgraded = pick(d["ram_gb"], d["busy"], data)
+            out["budget_gb"] = budget
+            out["recommendation"] = tier
+            out["downgraded_from"] = downgraded["primary"] if downgraded else None
+            out["disk_ok"] = (d["disk_free_gb"] is None
+                              or d["disk_free_gb"] >= tier["disk_gb"] * 1.5)
+        else:
+            out["recommendation"] = None
+            out["error"] = ("Apple Silicon required" if not d["apple_silicon"]
+                            else "could not read total RAM")
+        print(json.dumps(out, indent=2))
+        return 0 if out.get("recommendation") else 2
+
+    if a.quiet:
+        if not (d["apple_silicon"] and d["ram_gb"]):
+            return 2
+        tier, _, _ = pick(d["ram_gb"], d["busy"], data)
+        print(tier["primary"])
+        return 0
+
+    return report(d, data)
+
+
+if __name__ == "__main__":
+    sys.exit(main())

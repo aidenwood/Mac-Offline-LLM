@@ -1,0 +1,144 @@
+#!/usr/bin/env python3
+"""
+llm-probe-tools — does this model ACTUALLY emit structured tool calls?
+
+This matters more than it sounds. A model that fails will happily reply
+"I've created the file as requested" when no file exists, because the harness
+never saw a tool call and treated the response as a finished answer. Confident
+fiction is worse than an error.
+
+Three variants, because two of them were measured failing here while the naive
+single-turn probe passed:
+
+  1. plain                  one user turn
+  2. with a system message  ollama's qwen3-coder template injects the tool
+                            definitions into the system slot, so a user-supplied
+                            system message displaces them
+  3. after tool history     the same template drops the definitions once there
+                            is a `tool` role in the conversation
+
+A model only earns "safe for agentic use" by passing all three. Failing 2 or 3
+is survivable — llm-agent folds the system prompt into the user turn and parses
+text-format calls back out — but you should know which crutch you are leaning on.
+
+  llm-probe-tools <model> [--port 11434] [--json]
+
+Exit 0 = variant 1 passed (usable). Exit 1 = not usable agentically.
+Python 3.9 compatible.
+"""
+
+import argparse
+import json
+import sys
+import urllib.error
+import urllib.request
+
+TOOL = {
+    "type": "function",
+    "function": {
+        "name": "list_dir",
+        "description": "List the files in a directory.",
+        "parameters": {
+            "type": "object",
+            "properties": {"path": {"type": "string"}},
+            "required": ["path"],
+        },
+    },
+}
+
+USER = {"role": "user", "content": "List the files in /tmp. Use the tool."}
+SYSTEM = {"role": "system", "content": "You are a helpful coding assistant."}
+
+
+def call(port, model, messages):
+    body = {"messages": messages, "tools": [TOOL], "max_tokens": 200}
+    if model:
+        body["model"] = model
+    req = urllib.request.Request(
+        "http://localhost:{}/v1/chat/completions".format(port),
+        data=json.dumps(body).encode(),
+        headers={"Content-Type": "application/json"})
+    try:
+        with urllib.request.urlopen(req, timeout=300) as r:
+            return json.load(r)["choices"][0]["message"], None
+    except urllib.error.HTTPError as e:
+        return None, "HTTP {}: {}".format(e.code, e.read().decode(errors="ignore")[:200])
+    except Exception as e:
+        return None, "{}: {}".format(type(e).__name__, e)
+
+
+def judge(msg):
+    """(passed, detail). Structured call with the right name = pass."""
+    if msg is None:
+        return False, "no response"
+    calls = msg.get("tool_calls")
+    if calls:
+        fn = calls[0].get("function", {})
+        if fn.get("name") != "list_dir":
+            return False, "called the wrong function: {}".format(fn.get("name"))
+        try:
+            json.loads(fn.get("arguments") or "{}")
+        except Exception:
+            return False, "arguments were not valid JSON"
+        return True, "structured tool_calls"
+    body = msg.get("content") or ""
+    if "<function=" in body or "tool_call" in body or "▁tool" in body:
+        return False, "emitted a tool call as TEXT (harness cannot see it)"
+    return False, "answered in prose, no tool call"
+
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("model", nargs="?", default=None)
+    ap.add_argument("--port", type=int, default=11434)
+    ap.add_argument("--json", action="store_true")
+    a = ap.parse_args()
+
+    variants = [
+        ("plain", [USER]),
+        ("with system message", [SYSTEM, USER]),
+        ("after tool history", [
+            USER,
+            {"role": "assistant", "content": "", "tool_calls": [{
+                "id": "probe0", "type": "function",
+                "function": {"name": "list_dir", "arguments": '{"path":"/tmp"}'}}]},
+            {"role": "tool", "tool_call_id": "probe0", "content": "a.txt\nb.txt"},
+            {"role": "user", "content": "Now list /var. Use the tool."},
+        ]),
+    ]
+
+    results = []
+    for name, messages in variants:
+        msg, err = call(a.port, a.model, messages)
+        if err:
+            results.append((name, False, err))
+            continue
+        passed, detail = judge(msg)
+        results.append((name, passed, detail))
+
+    if a.json:
+        print(json.dumps({
+            "model": a.model,
+            "usable": results[0][1],
+            "variants": [{"name": n, "pass": p, "detail": d} for n, p, d in results],
+        }, indent=2))
+    else:
+        print("  tool-calling probe: {}".format(a.model or "(llama-server default)"))
+        for name, passed, detail in results:
+            print("    {} {:<22} {}".format("✓" if passed else "✗", name, detail))
+        if not results[0][1]:
+            print()
+            print("    ✗ NOT SAFE for agentic use. This model will claim it did")
+            print("      work it never did. Use it for chat only.")
+        elif not all(p for _, p, _ in results):
+            print()
+            print("    ⚠ usable, but it needs the workarounds in llm-agent")
+            print("      (system prompt folded into the user turn, text-format")
+            print("      tool calls parsed back out). Plain OpenAI clients will")
+            print("      hit the failures above.")
+
+    return 0 if results[0][1] else 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())
