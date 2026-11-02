@@ -72,6 +72,64 @@ loops of restating. Tune with `--whip-minutes`.
 Disable for one run even when armed: `touch /tmp/.whip-it-good-off` — same escape hatch as
 the real hook.
 
+## Room: Long-running chat
+
+```bash
+llm-agent --chat --yolo --unrestricted --port 11434 --model qwen3-coder:30b
+```
+
+A persistent REPL: history carries across turns, tools stay live, and the model
+remembers what it built three turns ago.
+
+```
+/exit /quit        leave
+/reset             clear history (keeps the rules)
+/whip [mins]       toggle the whip, optionally set the floor
+/verify            toggle running tests before each answer
+/cd <path>         change the working directory mid-session
+/yolo              toggle arbitrary bash
+/tokens            context usage
+/save <file>       write the conversation out
+/help
+```
+
+Every turn is logged to `/tmp/llm-agent-transcripts/<session>.chat.md`.
+
+**Each chat turn is its own whip turn.** The start stamp is reset per turn, so the floor
+measures *this* turn rather than the whole session — otherwise an hour-long chat trivially
+satisfies a 10-minute floor and the whip stops meaning anything.
+
+**Context is trimmed, not dropped.** Tool output is bulky and a long session will overflow
+32k. `trim()` keeps the first message (which carries the rules) and discards the oldest
+middle turns, never orphaning a `tool` result from its call. Without it the backend
+truncates silently from the front — which removes the rules first and leaves you wondering
+why the model stopped behaving. `/tokens` shows where you are.
+
+## Room: Unlimited permissions, and the one thing still refused
+
+`--yolo` lifts the bash allowlist. `--unrestricted` lifts the `--workdir` write
+confinement. Together they give a local model your shell.
+
+**That is a real risk and it is Aiden's to take** — it is his machine. But one list is
+refused regardless:
+
+```
+rm -rf / | rm -rf ~ | sudo rm        mkfs | diskutil erase/reformat/partition
+dd of=/dev/disk*                     > /dev/disk*
+fork bombs                           shutdown | halt | reboot
+killall -9 WindowServer/launchd      force-push to main/master
+```
+
+This is **not** a security boundary — a model with shell access can do anything, and a
+determined one could trivially route around a regex. It stops the handful of commands
+that end the *machine* rather than the session, which a 30B has no judgement about and
+will emit if a task description nudges it that way.
+
+Ordinary work is untouched: `rm -rf node_modules`, `rm -rf dist`, `dd if=a.img of=b.img`,
+`git push origin main` all pass. 18/18 on the guard cases in `test-whip`.
+
+If you genuinely need one of those commands, run it yourself.
+
 ## Room: Tool safety
 
 Writes are confined to `--workdir`. `bash` is restricted to a read-only allowlist (`ls`,

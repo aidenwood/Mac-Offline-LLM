@@ -21,6 +21,10 @@ Usage
   llm-agent --port 8081 "task"            a different llama-server
   llm-agent --port 11434 --model qwen3-coder:30b "task"   via ollama (unloads when idle)
 
+  llm-agent --chat --yolo --unrestricted --port 11434 --model qwen3-coder:30b
+      long-running interactive session, full shell, writes anywhere.
+      /help for in-chat commands.
+
 Arming matches the real hook: --whip literally puts "whip it good" in the prompt the
 hook sees, so the same string match that arms a Claude Code session arms this one.
 
@@ -136,6 +140,23 @@ TOOLS = [
 
 WRITERS = {"write_file", "edit_file"}
 
+# Refused even under --yolo. Not a security boundary — a local model with shell access
+# can do anything it likes. This only stops the handful of commands that end the
+# machine rather than the session, which a 30B has no judgement about and will
+# cheerfully emit if a task description nudges it that way.
+CATASTROPHIC = re.compile(
+    r"(\brm\s+(-[a-zA-Z]*[rf][a-zA-Z]*\s+)+(/|~|\$HOME|/\*|\.\s*$|/Users/?\s*$)"
+    r"|\bmkfs(\.|\s)|\bdiskutil\s+(erase|reformat|partition)"
+    r"|\bdd\b[^|]*\bof=/dev/(disk|rdisk)"
+    r"|>\s*/dev/(disk|rdisk)"
+    r"|\bchmod\s+-R\s+000\s+/"
+    r"|:\s*\(\s*\)\s*\{.*\|.*&.*\}\s*;?\s*:"       # fork bomb (no \b — ':' isn't a word char)
+    r"|\bshutdown\b|\bhalt\b|\breboot\b"
+    r"|\bkillall\s+-9\s+(kernel_task|WindowServer|launchd)"
+    r"|\bsudo\s+rm\b"
+    r"|\bgit\s+push\s+.*--force.*\b(main|master)\b)",
+    re.I)
+
 # "it ended by asking instead of building" — deliberately narrow so a report that
 # merely contains a question mark does not trip it.
 ASKED_A_QUESTION = re.compile(
@@ -227,11 +248,12 @@ def run_verification(workdir):
     return p.returncode == 0, label, out
 
 
-def run_tool(name, args, workdir, yolo, transcript):
+def run_tool(name, args, workdir, yolo, transcript, unrestricted=False):
     def resolve(p):
         q = (workdir / p).resolve() if not os.path.isabs(p) else pathlib.Path(p).resolve()
-        if name in WRITERS and workdir not in q.parents and q != workdir:
-            raise PermissionError(f"writes confined to {workdir}")
+        if name in WRITERS and not unrestricted \
+                and workdir not in q.parents and q != workdir:
+            raise PermissionError(f"writes confined to {workdir} (--unrestricted to lift)")
         return q
 
     try:
@@ -261,6 +283,10 @@ def run_tool(name, args, workdir, yolo, transcript):
 
         if name == "bash":
             cmd = args["command"]
+            if CATASTROPHIC.search(cmd):
+                return ("REFUSED: that command destroys the machine, not the session. "
+                        "Refused even under --yolo. If you genuinely need it, Aiden "
+                        "runs it himself.")
             if not yolo and not SAFE_BASH.match(cmd):
                 return ("REFUSED: not on the read-only allowlist. Re-run llm-agent "
                         "with --yolo to permit arbitrary shell, or use read_file / "
@@ -303,6 +329,45 @@ def system_prompt(rules):
     return "".join(parts)
 
 
+
+# ───────────────────────────── chat plumbing ───────────────────────────────
+
+def approx_tokens(messages):
+    """Rough token count. ~3.6 chars/token is close enough to decide when to trim."""
+    return sum(len(json.dumps(m)) for m in messages) // 4
+
+
+def trim(messages, limit):
+    """Keep the first turn (it carries the rules) and drop the oldest middle turns.
+
+    A long-running chat WILL overflow the context — tool output is bulky. Without
+    this the backend starts truncating silently from the front, which quietly
+    removes the system prompt and the rules with it.
+    """
+    if approx_tokens(messages) < limit * 0.75:
+        return messages, 0
+    head, rest = messages[:1], messages[1:]
+    dropped = 0
+    while rest and approx_tokens(head + rest) > limit * 0.55:
+        # never orphan a tool result from its call
+        rest.pop(0)
+        while rest and rest[0].get("role") == "tool":
+            rest.pop(0)
+        dropped += 1
+    return head + rest, dropped
+
+
+SLASH_HELP = """commands:
+  /exit /quit        leave
+  /reset             clear history (keeps the rules)
+  /whip [mins]       toggle whip, optionally set the floor
+  /verify            toggle running tests before each answer
+  /cd <path>         change the working directory
+  /yolo              toggle arbitrary bash
+  /tokens            show context usage
+  /save <file>       write the conversation to a file
+  /help              this"""
+
 # ────────────────────────────────── loop ───────────────────────────────────
 
 def chat(port, messages, model=None, use_tools=True):
@@ -335,7 +400,7 @@ def chat(port, messages, model=None, use_tools=True):
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("task")
+    ap.add_argument("task", nargs="?", default=None)
     ap.add_argument("--whip", action="store_true",
                     help="arm Whip-It-Good: refuse to finish a work run early")
     ap.add_argument("--whip-minutes", type=int, default=10,
@@ -350,6 +415,12 @@ def main():
     ap.add_argument("--workdir", default=os.getcwd())
     ap.add_argument("--max-steps", type=int, default=40)
     ap.add_argument("--yolo", action="store_true", help="allow arbitrary bash")
+    ap.add_argument("--chat", action="store_true",
+                    help="interactive REPL that keeps history across turns")
+    ap.add_argument("--unrestricted", action="store_true",
+                    help="lift the --workdir write confinement (writes anywhere)")
+    ap.add_argument("--ctx", type=int, default=32768,
+                    help="model context window, used to decide when to trim history")
     ap.add_argument("--verify", action="store_true",
                     help="before finishing, run the project's tests (pytest / npm test). "
                          "Failures go back to the model as the next task.")
@@ -366,7 +437,7 @@ def main():
 
     # Arm via the hook's own string match — same trigger as a Claude Code session.
     hook("start", {"session_id": sid,
-                   "prompt": "whip it good" if a.whip else a.task})
+                   "prompt": "whip it good" if a.whip else (a.task or "")})
 
     env_note = ""
     if a.whip:
@@ -384,16 +455,41 @@ def main():
     # final answer, and the model cheerfully reports success for work it never did.
     # Measured 2026-11-02 — identical request, system message the only difference.
     # Folding the prompt into the first user turn keeps both the rules and the tools.
-    if a.no_system or a.port == 11434:
+    fold = a.no_system or a.port == 11434
+
+    if a.chat and not a.task:
+        # Seed the rules as a completed exchange so there is a stable head for trim()
+        # to preserve, and the first thing the user types is a normal turn.
+        if fold:
+            messages = [{"role": "user", "content": sysmsg},
+                        {"role": "assistant", "content": "Understood. Ready."}]
+        else:
+            messages = [{"role": "system", "content": sysmsg}]
+    elif fold:
         messages = [{"role": "user", "content": f"{sysmsg}\n\n---\n\n{a.task}"}]
     else:
         messages = [{"role": "system", "content": sysmsg},
                     {"role": "user", "content": a.task}]
 
+    if not a.chat and not a.task:
+        sys.exit("nothing to do: give a task, or use --chat for an interactive session.")
+
+    state = {"workdir": workdir, "sid": sid, "transcript": transcript}
+
+    if a.chat:
+        return chat_repl(a, messages, state)
+
+    run_turn(a, messages, state)
+
+
+def run_turn(a, messages, state):
+    """One agentic turn: loop tools until the model finishes and the gates allow it."""
+    workdir, sid, transcript = state["workdir"], state["sid"], state["transcript"]
     strikes = 0
     wrote_anything = [False]
     question_strike = [False]
     verify_rounds = [0]
+
     for step in range(a.max_steps):
         msg = chat(a.port, messages, a.model)
         messages.append(msg)
@@ -415,9 +511,10 @@ def main():
                     args = json.loads(fn.get("arguments") or "{}")
                 except Exception:
                     args = {}
-                print(f"  → {fn['name']}({', '.join(f'{k}={str(v)[:50]!r}' for k, v in args.items())})",
-                      file=sys.stderr)
-                result = run_tool(fn["name"], args, workdir, a.yolo, transcript)
+                shown = ", ".join(f"{k}={str(v)[:50]!r}" for k, v in args.items())
+                print(f"  \u2192 {fn['name']}({shown})", file=sys.stderr)
+                result = run_tool(fn["name"], args, state["workdir"], a.yolo,
+                                  transcript, a.unrestricted)
                 if fn["name"] in WRITERS and not str(result).startswith("ERROR"):
                     wrote_anything[0] = True
                 messages.append({"role": "tool", "tool_call_id": c["id"],
@@ -431,9 +528,7 @@ def main():
         # The hook's work-turn test is "did it edit files", which is right for Claude
         # Code but leaves a hole here: a local model handed an explicit build task can
         # end the run by asking a clarifying question, edit nothing, and sail straight
-        # through as a "conversational turn". That is the exact smoke break the whip
-        # exists to stop. One forced retry, then it goes through — same one-strike
-        # shape as the hook, so it can never deadlock.
+        # through as a "conversational turn". One forced retry, then it goes through.
         if reason is None and a.whip and not question_strike[0]:
             body = msg.get("content") or ""
             if not wrote_anything[0] and ASKED_A_QUESTION.search(body):
@@ -449,10 +544,10 @@ def main():
         # the next task, whipped or not — a run that ends with red tests is not done.
         if reason is None and a.verify and wrote_anything[0] \
                 and verify_rounds[0] < a.verify_rounds:
-            ok, label, out = run_verification(workdir)
+            ok, label, out = run_verification(state["workdir"])
             if label and not ok:
                 verify_rounds[0] += 1
-                print(f"\n✗ VERIFY ({label} failed, round {verify_rounds[0]}/"
+                print(f"\n\u2717 VERIFY ({label} failed, round {verify_rounds[0]}/"
                       f"{a.verify_rounds}) — sending the failure back\n", file=sys.stderr)
                 reason = (
                     f"You said the work was done, but `{label}` FAILS. You did not run "
@@ -464,12 +559,14 @@ def main():
                     "you have not performed."
                 )
             elif label and ok:
-                print(f"\n✓ VERIFY ({label} passed)", file=sys.stderr)
+                print(f"\n\u2713 VERIFY ({label} passed)", file=sys.stderr)
 
         if reason:
             strikes += 1
-            label = "asked instead of building" if question_strike[0] and strikes == 1 and not wrote_anything[0] else "under the floor"
-            print(f"\n⟳ WHIP (strike {strikes}, {label}) — forced to keep going\n",
+            why = ("asked instead of building"
+                   if question_strike[0] and strikes == 1 and not wrote_anything[0]
+                   else "under the floor")
+            print(f"\n\u27f3 WHIP (strike {strikes}, {why}) — forced to keep going\n",
                   file=sys.stderr)
             messages.append({"role": "user", "content": reason})
             continue
@@ -477,12 +574,105 @@ def main():
         print(msg.get("content") or "(no output)")
         tail = f"[{step + 1} steps, {strikes} whip strike(s)"
         if a.verify:
-            ok, label, _ = run_verification(workdir)
-            tail += f", {label}: {'PASS' if ok else 'FAIL'}" if label else ", no tests found"
+            ok, label, _ = run_verification(state["workdir"])
+            tail += (f", {label}: {'PASS' if ok else 'FAIL'}" if label
+                     else ", no tests found")
         print("\n" + tail + "]", file=sys.stderr)
         return
 
     print(f"[hit --max-steps {a.max_steps}]", file=sys.stderr)
+
+
+def chat_repl(a, messages, state):
+    """Long-running interactive chat. History persists; context is trimmed, not dropped."""
+    log = pathlib.Path("/tmp/llm-agent-transcripts") / f"{state['sid']}.chat.md"
+    print(f"\n  model     {a.model or 'llama-server'}  on :{a.port}")
+    print(f"  workdir   {state['workdir']}"
+          f"{'  (UNRESTRICTED — writes anywhere)' if a.unrestricted else ''}")
+    print(f"  bash      {'UNRESTRICTED' if a.yolo else 'read-only allowlist'}"
+          "   (machine-destroying commands always refused)")
+    print(f"  whip      {'on, ' + str(a.whip_minutes) + ' min floor' if a.whip else 'off'}"
+          f"    verify  {'on' if a.verify else 'off'}")
+    print(f"  log       {log}")
+    print("  /help for commands, /exit to leave\n")
+
+    while True:
+        try:
+            line = input("\033[1m›\033[0m ").strip()
+        except (EOFError, KeyboardInterrupt):
+            print("\nbye")
+            return
+        if not line:
+            continue
+
+        if line.startswith("/"):
+            cmd, _, arg = line[1:].partition(" ")
+            cmd, arg = cmd.lower(), arg.strip()
+            if cmd in ("exit", "quit", "q"):
+                print("bye")
+                return
+            if cmd == "help":
+                print(SLASH_HELP)
+            elif cmd == "reset":
+                del messages[1:]
+                print("  history cleared (rules kept)")
+            elif cmd == "whip":
+                if arg.isdigit():
+                    a.whip_minutes = int(arg)
+                a.whip = not a.whip if not arg.isdigit() else True
+                os.environ["WHIP_MIN_WORK_SECONDS"] = str(a.whip_minutes * 60)
+                armed = pathlib.Path(f"/tmp/.whip-on-{state['sid']}")
+                armed.touch() if a.whip else armed.unlink(missing_ok=True)
+                print(f"  whip {'on, ' + str(a.whip_minutes) + ' min floor' if a.whip else 'off'}")
+            elif cmd == "verify":
+                a.verify = not a.verify
+                print(f"  verify {'on' if a.verify else 'off'}")
+            elif cmd == "yolo":
+                a.yolo = not a.yolo
+                print(f"  bash {'UNRESTRICTED' if a.yolo else 'read-only allowlist'}")
+            elif cmd == "cd":
+                q = pathlib.Path(arg).expanduser().resolve()
+                if q.is_dir():
+                    state["workdir"] = q
+                    print(f"  workdir {q}")
+                else:
+                    print(f"  no such directory: {q}")
+            elif cmd == "tokens":
+                n = approx_tokens(messages)
+                print(f"  ~{n} / {a.ctx} tokens ({100 * n // max(a.ctx, 1)}%), "
+                      f"{len(messages)} messages")
+            elif cmd == "save":
+                dst = pathlib.Path(arg or "conversation.md").expanduser()
+                dst.write_text(log.read_text() if log.exists() else "")
+                print(f"  saved {dst}")
+            else:
+                print(f"  unknown command /{cmd} — /help")
+            continue
+
+        messages.append({"role": "user", "content": line})
+        messages[:], dropped = trim(messages, a.ctx)
+        if dropped:
+            print(f"  (trimmed {dropped} old turn(s) to stay inside {a.ctx} ctx)",
+                  file=sys.stderr)
+
+        # Each chat turn is its own whip turn — restamp so the floor measures THIS
+        # turn, not the whole session. Otherwise a long session silently satisfies
+        # the floor and the whip stops meaning anything.
+        hook("start", {"session_id": state["sid"],
+                       "prompt": "whip it good" if a.whip else line})
+        state["transcript"] = Transcript(state["sid"])
+
+        try:
+            run_turn(a, messages, state)
+        except SystemExit:
+            raise
+        except Exception as e:
+            print(f"  error: {type(e).__name__}: {e}", file=sys.stderr)
+
+        with log.open("a") as fh:
+            fh.write(f"\n## › {line}\n\n")
+            last = messages[-1].get("content") if messages else ""
+            fh.write((last or "") + "\n")
 
 
 if __name__ == "__main__":
