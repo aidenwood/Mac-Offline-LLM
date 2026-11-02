@@ -16,6 +16,7 @@ Usage
   llm-agent "task"                        plain agentic loop
   llm-agent --whip "task"                 arm Whip-It-Good for this run
   llm-agent --whip --whip-minutes 10 "…"  shorter floor for local-model speeds
+  llm-agent --verify "task"               run the project's tests before finishing
   llm-agent --rules code,comms "task"     load specific halls as system prompt
   llm-agent --port 8081 "task"            a different llama-server
   llm-agent --port 11434 --model qwen3-coder:30b "task"   via ollama (unloads when idle)
@@ -186,6 +187,46 @@ def recover_text_tool_calls(content):
     return out
 
 
+# ────────────────────────────── verification ───────────────────────────────
+# The whip makes a local model keep going. It does NOT make it correct. Measured
+# 2026-11-02: a whipped run wrote test_app.py asserting the route returns
+# 'Hello, World!', was pushed to keep improving, changed the route to return a
+# longer string, never updated the test — then reported "all files have been
+# verified and are in place". Nothing had been run.
+#
+# So run it. If the work produced tests, they have to pass before the run is allowed
+# to finish; a failure goes back to the model as the next task.
+
+def detect_test_command(workdir):
+    """Return (argv, label) for this project's tests, or None."""
+    if list(workdir.glob("test_*.py")) or list(workdir.glob("*_test.py")) \
+            or (workdir / "tests").is_dir():
+        return ([sys.executable, "-m", "pytest", "-q"], "pytest")
+    pkg = workdir / "package.json"
+    if pkg.exists():
+        try:
+            if "test" in (json.loads(pkg.read_text()).get("scripts") or {}):
+                return (["npm", "test", "--silent"], "npm test")
+        except Exception:
+            pass
+    return None
+
+
+def run_verification(workdir):
+    """Run the project's tests. Returns (ok, label, output). ok=True if none found."""
+    found = detect_test_command(workdir)
+    if not found:
+        return True, None, ""
+    argv, label = found
+    try:
+        p = subprocess.run(argv, cwd=workdir, capture_output=True, text=True,
+                           timeout=300)
+    except Exception as e:
+        return False, label, f"could not run {label}: {e}"
+    out = ((p.stdout or "") + (p.stderr or ""))[-4000:]
+    return p.returncode == 0, label, out
+
+
 def run_tool(name, args, workdir, yolo, transcript):
     def resolve(p):
         q = (workdir / p).resolve() if not os.path.isabs(p) else pathlib.Path(p).resolve()
@@ -309,6 +350,11 @@ def main():
     ap.add_argument("--workdir", default=os.getcwd())
     ap.add_argument("--max-steps", type=int, default=40)
     ap.add_argument("--yolo", action="store_true", help="allow arbitrary bash")
+    ap.add_argument("--verify", action="store_true",
+                    help="before finishing, run the project's tests (pytest / npm test). "
+                         "Failures go back to the model as the next task.")
+    ap.add_argument("--verify-rounds", type=int, default=2,
+                    help="how many times a failing test may be sent back (default 2)")
     ap.add_argument("--no-system", action="store_true",
                     help="fold the system prompt into the first user turn. Forced on "
                          "ollama (:11434), where a system role breaks tool calling.")
@@ -347,6 +393,7 @@ def main():
     strikes = 0
     wrote_anything = [False]
     question_strike = [False]
+    verify_rounds = [0]
     for step in range(a.max_steps):
         msg = chat(a.port, messages, a.model)
         messages.append(msg)
@@ -398,6 +445,27 @@ def main():
                     "the tools now, and state your assumption in one line at the end."
                 )
 
+        # Verification gate. Runs before the whip so a genuine test failure is always
+        # the next task, whipped or not — a run that ends with red tests is not done.
+        if reason is None and a.verify and wrote_anything[0] \
+                and verify_rounds[0] < a.verify_rounds:
+            ok, label, out = run_verification(workdir)
+            if label and not ok:
+                verify_rounds[0] += 1
+                print(f"\n✗ VERIFY ({label} failed, round {verify_rounds[0]}/"
+                      f"{a.verify_rounds}) — sending the failure back\n", file=sys.stderr)
+                reason = (
+                    f"You said the work was done, but `{label}` FAILS. You did not run "
+                    f"it.\n\n{out}\n\n"
+                    "Fix the actual cause. If you changed behaviour after writing a "
+                    "test, the test is now wrong — update it to match. If an import "
+                    "fails, the dependency is not installed; make the test runnable "
+                    "without it or note it in the README. Do not claim verification "
+                    "you have not performed."
+                )
+            elif label and ok:
+                print(f"\n✓ VERIFY ({label} passed)", file=sys.stderr)
+
         if reason:
             strikes += 1
             label = "asked instead of building" if question_strike[0] and strikes == 1 and not wrote_anything[0] else "under the floor"
@@ -407,7 +475,11 @@ def main():
             continue
 
         print(msg.get("content") or "(no output)")
-        print(f"\n[{step + 1} steps, {strikes} whip strike(s)]", file=sys.stderr)
+        tail = f"[{step + 1} steps, {strikes} whip strike(s)"
+        if a.verify:
+            ok, label, _ = run_verification(workdir)
+            tail += f", {label}: {'PASS' if ok else 'FAIL'}" if label else ", no tests found"
+        print("\n" + tail + "]", file=sys.stderr)
         return
 
     print(f"[hit --max-steps {a.max_steps}]", file=sys.stderr)

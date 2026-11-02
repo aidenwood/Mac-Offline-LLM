@@ -64,3 +64,41 @@ DeepSeek tool-calling failure — came from primary sources and direct measureme
 contradicted the blog consensus.
 
 See `Aidxn-Context/halls/research-standards.md`.
+
+## Room: `dspark-*` / arch `dflash` is a DRAFT model, not a model
+
+Measured 2026-11-02. `dspark-DeepSeek-V4-Flash-0731-Q8_0.gguf` (10 GB) cannot be loaded
+on its own, ever:
+
+```
+llama_init_from_model: failed to initialize the context: dflash requires ctx_other to be set
+```
+
+Its `general.architecture` is `dflash` — the **DSpark speculative-decoding draft half** of
+DeepSeek-V4-Flash. llama.cpp says so in its own strings:
+
+> DeepSeek-V4.1 has no MTP graph: its DSpark draft is a separate DFLASH GGUF
+> (`convert_hf_to_gguf.py --dspark`), used with `--spec-type draft-dspark`
+
+It only runs attached to the full target model:
+
+```bash
+llama-server -m DeepSeek-V4-Flash-0731-Q4.gguf \
+             -md gguf/dspark-DeepSeek-V4-Flash-0731-Q8_0.gguf \
+             --spec-type draft-dspark
+```
+
+The target is a V4-class MoE — far beyond 36 GB unified memory and the ~14 GB free on this
+volume. **A 10 GB download that is 0% of a usable model.** Delete it or park it; it is not
+a candidate.
+
+`bin/gguf-arch <file>` prints any GGUF's architecture, `llm ls` shows it in a column, and
+`llm run/ask/serve` refuse `dflash` with this explanation instead of the cryptic context
+error. Check arch **before** a 10 GB pull, not after.
+
+## Room: One resident model at a time — 36 GB is the ceiling
+
+qwen3-coder:30b holds **20.4 GiB wired** while resident. A second copy (ollama *and*
+llama-server) does not fit and does not page out. `llm up` loads exactly one; `llm status`
+shows what is holding memory; `llm down` evicts it. `llm run/ask/serve` warn when ollama
+is still holding a model.

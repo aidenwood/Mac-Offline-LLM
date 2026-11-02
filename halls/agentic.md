@@ -193,8 +193,32 @@ import.
 It then reported *"All files have been verified and are in place."* They were not
 verified. Nothing was run.
 
-**Treat local agent output as a draft that compiles-by-luck.** Run the tests yourself.
-The whip buys you volume and follow-through, not correctness.
+**`--verify` closes the worst of this.** Before a run is allowed to finish, the project's
+tests are detected (`pytest` if `test_*.py` / `tests/` exists, else `npm test` if
+package.json defines it) and **actually run**. A failure goes back to the model as the
+next task, with the real output pasted in and an explicit instruction: if you changed
+behaviour after writing a test, the test is now wrong — update it; do not claim
+verification you have not performed. `--verify-rounds` caps the retries (default 2).
+
+```bash
+llm-agent --whip --verify --port 11434 --model qwen3-coder:30b "…"
+```
+
+The gate runs **before** the whip, so a red test is always the next task whether or not
+the run is whipped. A run that ends with failing tests is not done.
+
+**What `--verify` still does not fix:**
+
+- **No tests, no gate.** If the model writes no tests, there is nothing to run and the
+  run passes through. `--verify` reports "no tests found" rather than pretending.
+- **The model writes its own marking.** It can write a weak test that passes and call it
+  verified. The gate proves the test runs green, not that the test is worth anything.
+- **Clutter.** The whip rewards doing more, and "more" includes junk. A `wc2.py` run that
+  passed produced `demo.py`, `verify_wc2.py` AND `final_verification.py` alongside the
+  real files. Expect to delete things.
+
+**Treat local agent output as a draft.** `--verify` means it compiles and its own tests
+are green — not that it is correct.
 
 ## Room: Backends
 

@@ -1,0 +1,67 @@
+#!/usr/bin/env python3
+"""gguf-arch <file.gguf> — print general.architecture from a GGUF header.
+
+Used by `llm` to refuse unloadable architectures (draft-only models) with a real
+reason instead of llama.cpp's cryptic context error.
+"""
+import struct
+import sys
+
+# GGUF value type ids -> (struct fmt, size) for scalars
+SCALAR = {
+    0: ("<B", 1), 1: ("<b", 1), 2: ("<H", 2), 3: ("<h", 2),
+    4: ("<I", 4), 5: ("<i", 4), 6: ("<f", 4), 7: ("<?", 1),
+    10: ("<Q", 8), 11: ("<q", 8), 12: ("<d", 8),
+}
+STRING, ARRAY = 8, 9
+
+
+class Reader:
+    def __init__(self, f):
+        self.f = f
+
+    def raw(self, n):
+        b = self.f.read(n)
+        if len(b) != n:
+            raise EOFError
+        return b
+
+    def u32(self):
+        return struct.unpack("<I", self.raw(4))[0]
+
+    def u64(self):
+        return struct.unpack("<Q", self.raw(8))[0]
+
+    def string(self):
+        return self.raw(self.u64()).decode("utf-8", "replace")
+
+    def value(self, t):
+        if t == STRING:
+            return self.string()
+        if t == ARRAY:
+            et, n = self.u32(), self.u64()
+            return [self.value(et) for _ in range(n)]
+        fmt, size = SCALAR[t]
+        return struct.unpack(fmt, self.raw(size))[0]
+
+
+def arch(path):
+    with open(path, "rb") as f:
+        r = Reader(f)
+        if r.raw(4) != b"GGUF":
+            return ""
+        r.u32()          # version
+        r.u64()          # tensor count
+        for _ in range(r.u64()):
+            key = r.string()
+            val = r.value(r.u32())
+            if key == "general.architecture":
+                return val
+    return ""
+
+
+if __name__ == "__main__":
+    try:
+        print(arch(sys.argv[1]))
+    except Exception:
+        print("")

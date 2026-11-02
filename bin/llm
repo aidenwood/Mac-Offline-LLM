@@ -1,37 +1,135 @@
 #!/usr/bin/env bash
-# llm — thin wrapper over llama.cpp pointed at the Aidxn model store.
+# llm — thin wrapper over llama.cpp + ollama, pointed at the Aidxn model store.
 #
-#   llm ls                       list every GGUF available
+#   llm up [tag]                 ONE COMMAND: daemon up, model resident, ready to work
+#   llm agent "task"             up, then run the whipped agentic loop against it
+#   llm status                   what is running and what is holding memory
+#   llm down                     evict the resident model, free the wired RAM
+#
+#   llm ls                       list every GGUF available, with architecture
 #   llm run <match> [args...]    interactive chat (llama-cli)
 #   llm ask <match> "prompt"     one-shot completion, no chat UI (llama-completion)
-#   llm serve <match> [args...]  OpenAI-compatible server on :8080
+#   llm serve <match> [args...]  OpenAI-compatible server on :8080 (llama.cpp)
 #   llm bench <match>            llama-bench
 #
-# <match> is any substring of a filename in llm-stack/gguf/ (e.g. "coder-v2").
+# <match> is any substring of a filename in gguf/ (e.g. "coder-v2").
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 BIN="$ROOT/llama.cpp"
 GGUF="$ROOT/gguf"
+OLLAMA="http://127.0.0.1:11434"
+AGENT_MODEL="${LLM_AGENT_MODEL:-qwen3-coder:30b}"
+
+die() { echo "$*" >&2; exit 1; }
+
+# Architectures that are not standalone models. Loading one alone always fails.
+guard_arch() {
+  local a; a=$("$ROOT/bin/gguf-arch" "$1")
+  [ "$a" = "dflash" ] && die "$(cat <<EOF
+$(basename "$1") is arch 'dflash' — a DSpark DRAFT model, not a runnable model.
+It only works as the draft half of speculative decoding, alongside the full
+DeepSeek-V4-Flash target GGUF:
+
+  llama-server -m <target>.gguf -md $1 --spec-type draft-dspark
+
+You do not have the target, and it will not fit (14 GiB free on this volume).
+Run 'llm up' instead — qwen3-coder:30b is the working agentic model here.
+EOF
+)"
+  return 0
+}
 
 resolve() {
   local hits
   hits=$(ls "$GGUF" | grep -i -- "$1" || true)
-  [ -n "$hits" ] || { echo "no model matching '$1' in $GGUF" >&2; exit 1; }
+  [ -n "$hits" ] || die "no model matching '$1' in $GGUF"
   [ "$(echo "$hits" | wc -l)" -eq 1 ] || {
     echo "'$1' matches more than one model:" >&2; echo "$hits" >&2; exit 1; }
+  guard_arch "$GGUF/$hits"
   echo "$GGUF/$hits"
+}
+
+ollama_alive() { curl -sf --max-time 2 "$OLLAMA/api/tags" >/dev/null 2>&1; }
+
+resident() {  # prints the tag of each model currently holding memory
+  curl -sf --max-time 3 "$OLLAMA/api/ps" 2>/dev/null \
+    | python3 -c 'import json,sys
+d=json.load(sys.stdin)
+for m in d.get("models",[]):
+    print(m["name"], round(m.get("size_vram",0)/2**30,1))' 2>/dev/null || true
+}
+
+warn_wired() {  # a second full copy of a 20G model on a 36G box is a hard stall
+  local r; r=$(resident)
+  [ -n "$r" ] && {
+    echo "⚠  ollama still holds: $r GiB wired. Run 'llm down' first, or you will" >&2
+    echo "   be loading two copies into 36 GB of unified memory." >&2
+  }
+  return 0
+}
+
+bring_up() {
+  local tag="${1:-$AGENT_MODEL}"
+
+  if ! ollama_alive; then
+    echo "· starting ollama…"
+    nohup ollama serve >/tmp/ollama-serve.log 2>&1 &
+    for _ in $(seq 1 40); do ollama_alive && break; sleep 0.5; done
+    ollama_alive || die "ollama did not come up — see /tmp/ollama-serve.log"
+  fi
+
+  curl -sf --max-time 5 "$OLLAMA/api/tags" | grep -q "\"$tag\"" \
+    || { echo "· pulling $tag…"; ollama pull "$tag"; }
+
+  echo "· loading $tag (keep_alive 1h)…"
+  curl -sf --max-time 600 "$OLLAMA/api/generate" \
+    -d "{\"model\":\"$tag\",\"prompt\":\"\",\"keep_alive\":\"1h\"}" >/dev/null \
+    || die "failed to load $tag"
+
+  echo "✓ $tag ready on $OLLAMA  —  $(resident) GiB resident"
+  echo "  llm agent \"your task\"      whipped agentic loop"
+  echo "  llm down                    free the memory"
 }
 
 cmd="${1:-ls}"; shift || true
 
 case "$cmd" in
-  ls)    ls -lLh "$GGUF" | awk 'NR>1 {printf "%-50s %s\n", $NF, $5}' | sed "s|$GGUF/||" ;;
-  run)   m=$(resolve "$1"); shift; exec "$BIN/llama-cli"        -m "$m" -ngl 999 -c 8192 "$@" ;;
-  ask)   m=$(resolve "$1"); shift; p="$1"; shift || true
-         exec "$BIN/llama-completion" -m "$m" -ngl 999 -c 8192 -no-cnv -p "$p" "$@" ;;
-  serve) m=$(resolve "$1"); shift
-         exec "$BIN/llama-server"     -m "$m" -ngl 999 -c 8192 --port "${LLM_PORT:-8080}" "$@" ;;
-  bench) m=$(resolve "$1"); shift; exec "$BIN/llama-bench"  -m "$m" "$@" ;;
-  *)     exec "$BIN/llama-$cmd" "$@" ;;
+  up)     bring_up "${1:-$AGENT_MODEL}" ;;
+
+  agent)  bring_up "$AGENT_MODEL" >&2
+          exec "$ROOT/bin/llm-agent" --whip --port 11434 --model "$AGENT_MODEL" "$@" ;;
+
+  status) if ollama_alive; then
+            local_r=$(resident)
+            echo "ollama   up    ${local_r:-(nothing resident)}"
+          else
+            echo "ollama   down"
+          fi
+          curl -sf --max-time 2 "http://127.0.0.1:${LLM_PORT:-8080}/health" >/dev/null 2>&1 \
+            && echo "llama.cpp up on :${LLM_PORT:-8080}" || echo "llama.cpp down" ;;
+
+  down)   ollama_alive || { echo "ollama not running"; exit 0; }
+          while read -r tag _; do
+            [ -n "$tag" ] || continue
+            echo "· evicting $tag"
+            curl -sf --max-time 10 "$OLLAMA/api/generate" \
+              -d "{\"model\":\"$tag\",\"keep_alive\":0}" >/dev/null || true
+          done < <(resident)
+          echo "✓ memory freed" ;;
+
+  ls)     for f in "$GGUF"/*.gguf; do
+            printf "%-45s %8s  %s\n" "$(basename "$f")" \
+              "$(du -Lh "$f" | cut -f1)" "$("$ROOT/bin/gguf-arch" "$f")"
+          done ;;
+
+  run)    m=$(resolve "$1"); shift; warn_wired
+          exec "$BIN/llama-cli"        -m "$m" -ngl 999 -c 8192 "$@" ;;
+  ask)    m=$(resolve "$1"); shift; p="$1"; shift || true; warn_wired
+          exec "$BIN/llama-completion" -m "$m" -ngl 999 -c 8192 -no-cnv -p "$p" "$@" ;;
+  serve)  m=$(resolve "$1"); shift; warn_wired
+          exec "$BIN/llama-server"     -m "$m" -ngl 999 -c 8192 --jinja \
+                                       --port "${LLM_PORT:-8080}" "$@" ;;
+  bench)  m=$(resolve "$1"); shift; exec "$BIN/llama-bench"  -m "$m" "$@" ;;
+  *)      exec "$BIN/llama-$cmd" "$@" ;;
 esac

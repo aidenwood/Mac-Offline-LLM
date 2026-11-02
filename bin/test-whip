@@ -75,14 +75,51 @@ def strike_case():
           f"2nd={'BLOCKED' if second else 'allowed'}  (expected BLOCKED then allowed)")
 
 
+def verify_cases():
+    """The --verify gate: red tests must be detected and surfaced, not assumed."""
+    print("verify:")
+    import shutil
+    import tempfile
+    root = pathlib.Path(tempfile.mkdtemp(prefix="verify-"))
+
+    # 1. no tests at all → ok, nothing to gate on
+    ok, label, _ = agent.run_verification(root)
+    r1 = ok and label is None
+    results.append(r1)
+    print(f"  {PASS if r1 else FAIL}  no tests found → run is allowed through")
+
+    # 2. a passing test → ok
+    (root / "test_ok.py").write_text("def test_x():\n    assert 1 + 1 == 2\n")
+    ok, label, _ = agent.run_verification(root)
+    r2 = ok and label == "pytest"
+    results.append(r2)
+    print(f"  {PASS if r2 else FAIL}  passing pytest → allowed  (label={label})")
+
+    # 3. the exact failure mode seen in the wild: code changed under its own test
+    (root / "app.py").write_text("def greet():\n    return 'Hello, World! Welcome.'\n")
+    (root / "test_ok.py").write_text(
+        "from app import greet\n\n\ndef test_greet():\n"
+        "    assert greet() == 'Hello, World!'\n")
+    ok, label, out = agent.run_verification(root)
+    r3 = (not ok) and label == "pytest" and "assert" in out.lower()
+    results.append(r3)
+    print(f"  {PASS if r3 else FAIL}  code changed under its test → BLOCKED, "
+          f"failure captured ({len(out)} chars)")
+
+    shutil.rmtree(root, ignore_errors=True)
+
+
 print(f"hook: {agent.HOOK}")
 print(f"exists: {agent.HOOK.exists()}\n")
 
+print("whip:")
 case("unarmed work run stays out of the way",   False, 3, 10,   45, False)
 case("armed + edited + under floor  → blocked", True,  3, 10,   10, True)
 case("armed + edited + over floor   → allowed", True,  3, 4000, 10, False)
 case("armed but no edits (chat turn) → allowed", True, 0, 10,   10, False)
 strike_case()
+print()
+verify_cases()
 
 print(f"\n{sum(results)}/{len(results)} passed")
 sys.exit(0 if all(results) else 1)
