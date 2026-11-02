@@ -1,0 +1,290 @@
+#!/usr/bin/env python3
+"""
+llm-agent — an agentic loop over a local llama.cpp server, optionally whipped.
+
+llama-server is a stateless completion API: no turns, no Stop event, nothing for a
+Claude Code hook to intercept. This supplies the missing piece — a loop that has a
+concept of "the model is trying to finish" — and then hands that moment to the EXACT
+SAME ~/.claude/hooks/whip-it-good.sh that governs Claude Code.
+
+The hook is not reimplemented or copied here. It is invoked with the same JSON
+contract (session_id + transcript_path, event "start" / "stop"), so there is one
+definition of the rule and sharpening it in one place sharpens it everywhere.
+See Aidxn-Context/halls/code-standards.md — never fork a source of truth.
+
+Usage
+  llm-agent "task"                        plain agentic loop
+  llm-agent --whip "task"                 arm Whip-It-Good for this run
+  llm-agent --whip --whip-minutes 10 "…"  shorter floor for local-model speeds
+  llm-agent --rules code,comms "task"     load specific halls as system prompt
+  llm-agent --port 8081 "task"            a different llama-server
+
+Arming matches the real hook: --whip literally puts "whip it good" in the prompt the
+hook sees, so the same string match that arms a Claude Code session arms this one.
+
+Tools given to the model: list_dir, read_file, write_file, edit_file, bash.
+Writes are confined to --workdir (default: cwd). bash is allowlisted unless --yolo.
+"""
+
+import argparse
+import datetime as dt
+import json
+import os
+import pathlib
+import re
+import subprocess
+import sys
+import urllib.error
+import urllib.request
+import uuid
+
+HOOK = pathlib.Path.home() / ".claude" / "hooks" / "whip-it-good.sh"
+CONTEXT = pathlib.Path.home() / "Desktop" / "00 - Aidxn" / "Aidxn-Context"
+
+HALL_ALIASES = {
+    "code": "code-standards",
+    "comms": "comms-and-tone",
+    "git": "git-and-deploys",
+    "design": "design-standards",
+    "data": "data-db-safety",
+    "research": "research-standards",
+    "loop": "agent-loop-discipline",
+    "brand": "brand-and-voice",
+    "tooling": "tooling-and-estate",
+}
+
+# bash commands allowed without --yolo. Read-only / inspection only.
+SAFE_BASH = re.compile(
+    r"^\s*(ls|cat|head|tail|wc|grep|rg|find|file|stat|du|df|pwd|echo|which|"
+    r"git\s+(status|log|diff|show|branch\s*$)|python3?\s+-c|node\s+-e|"
+    r"npm\s+(run\s+(build|test|lint)|ls)|pytest|jq|sed\s+-n)\b"
+)
+
+
+# ─────────────────────────────── transcript ────────────────────────────────
+# whip-it-good.sh decides "was this a work turn?" by counting Edit/Write tool_use
+# blocks in a JSONL transcript newer than the turn's start stamp. Emit that shape.
+
+class Transcript:
+    def __init__(self, session_id):
+        d = pathlib.Path("/tmp/llm-agent-transcripts")
+        d.mkdir(parents=True, exist_ok=True)
+        self.path = d / f"{session_id}.jsonl"
+        self.path.write_text("")
+
+    def tool_use(self, name):
+        rec = {
+            "timestamp": dt.datetime.now(dt.timezone.utc).isoformat(),
+            "message": {"content": [{"type": "tool_use", "name": name}]},
+        }
+        with self.path.open("a") as fh:
+            fh.write(json.dumps(rec) + "\n")
+
+
+# ───────────────────────────────── the hook ────────────────────────────────
+
+def hook(event, payload):
+    """Call the real whip-it-good.sh. Returns its block reason, or None."""
+    if not HOOK.exists():
+        return None
+    try:
+        p = subprocess.run(
+            ["bash", str(HOOK), event],
+            input=json.dumps(payload),
+            capture_output=True, text=True, timeout=20,
+        )
+    except Exception:
+        return None                       # fail open, exactly as the hook does
+    out = (p.stdout or "").strip()
+    if not out:
+        return None
+    try:
+        return json.loads(out).get("reason")
+    except Exception:
+        return None
+
+
+# ───────────────────────────────── tools ───────────────────────────────────
+
+TOOLS = [
+    {"type": "function", "function": {
+        "name": "list_dir", "description": "List files in a directory.",
+        "parameters": {"type": "object", "properties": {
+            "path": {"type": "string"}}, "required": ["path"]}}},
+    {"type": "function", "function": {
+        "name": "read_file", "description": "Read a file's contents.",
+        "parameters": {"type": "object", "properties": {
+            "path": {"type": "string"}}, "required": ["path"]}}},
+    {"type": "function", "function": {
+        "name": "write_file", "description": "Write (or overwrite) a file.",
+        "parameters": {"type": "object", "properties": {
+            "path": {"type": "string"}, "content": {"type": "string"}},
+            "required": ["path", "content"]}}},
+    {"type": "function", "function": {
+        "name": "edit_file",
+        "description": "Replace an exact string in a file. old must appear exactly once.",
+        "parameters": {"type": "object", "properties": {
+            "path": {"type": "string"}, "old": {"type": "string"},
+            "new": {"type": "string"}}, "required": ["path", "old", "new"]}}},
+    {"type": "function", "function": {
+        "name": "bash", "description": "Run a shell command and return its output.",
+        "parameters": {"type": "object", "properties": {
+            "command": {"type": "string"}}, "required": ["command"]}}},
+]
+
+WRITERS = {"write_file", "edit_file"}
+
+
+def run_tool(name, args, workdir, yolo, transcript):
+    def resolve(p):
+        q = (workdir / p).resolve() if not os.path.isabs(p) else pathlib.Path(p).resolve()
+        if name in WRITERS and workdir not in q.parents and q != workdir:
+            raise PermissionError(f"writes confined to {workdir}")
+        return q
+
+    try:
+        if name == "list_dir":
+            q = resolve(args["path"])
+            return "\n".join(sorted(x.name + ("/" if x.is_dir() else "")
+                                    for x in q.iterdir())) or "(empty)"
+
+        if name == "read_file":
+            return resolve(args["path"]).read_text()[:40000]
+
+        if name == "write_file":
+            q = resolve(args["path"])
+            q.parent.mkdir(parents=True, exist_ok=True)
+            q.write_text(args["content"])
+            transcript.tool_use("Write")
+            return f"wrote {q} ({len(args['content'])} bytes)"
+
+        if name == "edit_file":
+            q = resolve(args["path"])
+            s = q.read_text()
+            if s.count(args["old"]) != 1:
+                return f"ERROR: old string appears {s.count(args['old'])} times, need exactly 1"
+            q.write_text(s.replace(args["old"], args["new"]))
+            transcript.tool_use("Edit")
+            return f"edited {q}"
+
+        if name == "bash":
+            cmd = args["command"]
+            if not yolo and not SAFE_BASH.match(cmd):
+                return ("REFUSED: not on the read-only allowlist. Re-run llm-agent "
+                        "with --yolo to permit arbitrary shell, or use read_file / "
+                        "write_file / edit_file instead.")
+            p = subprocess.run(cmd, shell=True, cwd=workdir,
+                               capture_output=True, text=True, timeout=120)
+            return ((p.stdout or "") + (p.stderr or ""))[:20000] or f"(exit {p.returncode})"
+
+    except Exception as e:
+        return f"ERROR: {type(e).__name__}: {e}"
+    return f"ERROR: unknown tool {name}"
+
+
+# ───────────────────────────── system prompt ───────────────────────────────
+
+def system_prompt(rules):
+    parts = ["You are a coding agent working on Aiden Wood's machine. "
+             "You have tools. Use them rather than guessing or describing what you "
+             "would do. Keep working until the task is actually finished."]
+    if rules:
+        for key in rules:
+            name = HALL_ALIASES.get(key.strip(), key.strip())
+            f = CONTEXT / "halls" / f"{name}.md"
+            if f.exists():
+                parts.append(f"\n\n# RULES — {name}\n\n{f.read_text()}")
+            else:
+                print(f"  ! no hall '{name}' — skipping", file=sys.stderr)
+    return "".join(parts)
+
+
+# ────────────────────────────────── loop ───────────────────────────────────
+
+def chat(port, messages, use_tools=True):
+    body = {"messages": messages, "max_tokens": 2048}
+    if use_tools:
+        body["tools"] = TOOLS
+    req = urllib.request.Request(
+        f"http://localhost:{port}/v1/chat/completions",
+        data=json.dumps(body).encode(), headers={"Content-Type": "application/json"})
+    try:
+        with urllib.request.urlopen(req, timeout=600) as r:
+            return json.load(r)["choices"][0]["message"]
+    except urllib.error.URLError as e:
+        sys.exit(f"cannot reach llama-server on :{port} — start one with "
+                 f"`llm serve <model>`  ({e})")
+
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("task")
+    ap.add_argument("--whip", action="store_true",
+                    help="arm Whip-It-Good: refuse to finish a work run early")
+    ap.add_argument("--whip-minutes", type=int, default=10,
+                    help="minimum work-run length while whipped (default 10; "
+                         "Claude Code's default is 45)")
+    ap.add_argument("--rules", default="",
+                    help="comma-separated halls to load as system prompt, e.g. code,comms")
+    ap.add_argument("--port", type=int, default=int(os.environ.get("LLM_PORT", 8080)))
+    ap.add_argument("--workdir", default=os.getcwd())
+    ap.add_argument("--max-steps", type=int, default=40)
+    ap.add_argument("--yolo", action="store_true", help="allow arbitrary bash")
+    a = ap.parse_args()
+
+    workdir = pathlib.Path(a.workdir).resolve()
+    sid = f"llmagent-{uuid.uuid4().hex[:12]}"
+    transcript = Transcript(sid)
+
+    # Arm via the hook's own string match — same trigger as a Claude Code session.
+    hook("start", {"session_id": sid,
+                   "prompt": "whip it good" if a.whip else a.task})
+
+    env_note = ""
+    if a.whip:
+        os.environ["WHIP_MIN_WORK_SECONDS"] = str(a.whip_minutes * 60)
+        env_note = f"  [whipped: {a.whip_minutes} min floor]"
+    print(f"session {sid}  workdir {workdir}{env_note}", file=sys.stderr)
+
+    rules = [r for r in a.rules.split(",") if r.strip()]
+    messages = [{"role": "system", "content": system_prompt(rules)},
+                {"role": "user", "content": a.task}]
+
+    strikes = 0
+    for step in range(a.max_steps):
+        msg = chat(a.port, messages)
+        messages.append(msg)
+
+        calls = msg.get("tool_calls") or []
+        if calls:
+            for c in calls:
+                fn = c["function"]
+                try:
+                    args = json.loads(fn.get("arguments") or "{}")
+                except Exception:
+                    args = {}
+                print(f"  → {fn['name']}({', '.join(f'{k}={str(v)[:50]!r}' for k, v in args.items())})",
+                      file=sys.stderr)
+                result = run_tool(fn["name"], args, workdir, a.yolo, transcript)
+                messages.append({"role": "tool", "tool_call_id": c["id"],
+                                 "content": str(result)[:20000]})
+            continue
+
+        # No tool calls — the model is trying to finish. This is the Stop moment.
+        reason = hook("stop", {"session_id": sid,
+                               "transcript_path": str(transcript.path)})
+        if reason:
+            strikes += 1
+            print(f"\n⟳ WHIP (strike {strikes}) — forced to keep going\n", file=sys.stderr)
+            messages.append({"role": "user", "content": reason})
+            continue
+
+        print(msg.get("content") or "(no output)")
+        print(f"\n[{step + 1} steps, {strikes} whip strike(s)]", file=sys.stderr)
+        return
+
+    print(f"[hit --max-steps {a.max_steps}]", file=sys.stderr)
+
+
+if __name__ == "__main__":
+    main()

@@ -1,0 +1,11 @@
+# Model weights and binaries — re-downloadable, ~75G
+llama.cpp/
+models/
+ollama/
+gguf/
+
+# Noise
+.DS_Store
+__pycache__/
+*.pyc
+*.log

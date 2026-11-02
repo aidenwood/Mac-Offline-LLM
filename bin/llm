@@ -1,0 +1,37 @@
+#!/usr/bin/env bash
+# llm — thin wrapper over llama.cpp pointed at the Aidxn model store.
+#
+#   llm ls                       list every GGUF available
+#   llm run <match> [args...]    interactive chat (llama-cli)
+#   llm ask <match> "prompt"     one-shot completion, no chat UI (llama-completion)
+#   llm serve <match> [args...]  OpenAI-compatible server on :8080
+#   llm bench <match>            llama-bench
+#
+# <match> is any substring of a filename in llm-stack/gguf/ (e.g. "coder-v2").
+set -euo pipefail
+
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+BIN="$ROOT/llama.cpp"
+GGUF="$ROOT/gguf"
+
+resolve() {
+  local hits
+  hits=$(ls "$GGUF" | grep -i -- "$1" || true)
+  [ -n "$hits" ] || { echo "no model matching '$1' in $GGUF" >&2; exit 1; }
+  [ "$(echo "$hits" | wc -l)" -eq 1 ] || {
+    echo "'$1' matches more than one model:" >&2; echo "$hits" >&2; exit 1; }
+  echo "$GGUF/$hits"
+}
+
+cmd="${1:-ls}"; shift || true
+
+case "$cmd" in
+  ls)    ls -lLh "$GGUF" | awk 'NR>1 {printf "%-50s %s\n", $NF, $5}' | sed "s|$GGUF/||" ;;
+  run)   m=$(resolve "$1"); shift; exec "$BIN/llama-cli"        -m "$m" -ngl 999 -c 8192 "$@" ;;
+  ask)   m=$(resolve "$1"); shift; p="$1"; shift || true
+         exec "$BIN/llama-completion" -m "$m" -ngl 999 -c 8192 -no-cnv -p "$p" "$@" ;;
+  serve) m=$(resolve "$1"); shift
+         exec "$BIN/llama-server"     -m "$m" -ngl 999 -c 8192 --port "${LLM_PORT:-8080}" "$@" ;;
+  bench) m=$(resolve "$1"); shift; exec "$BIN/llama-bench"  -m "$m" "$@" ;;
+  *)     exec "$BIN/llama-$cmd" "$@" ;;
+esac

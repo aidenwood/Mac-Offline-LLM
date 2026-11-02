@@ -1,0 +1,88 @@
+#!/usr/bin/env python3
+"""
+test-whip — prove llm-agent's Whip-It-Good wiring without needing a loaded model.
+
+The whip decision depends only on (armed?, elapsed, did-it-edit?), all of which live
+in the hook. So the integration can be tested by driving the hook through the same
+code path llm-agent uses, with a synthetic transcript.
+
+Run:  test-whip
+"""
+import importlib.machinery
+import importlib.util
+import os
+import pathlib
+import sys
+import time
+import uuid
+
+HERE = pathlib.Path(__file__).resolve().parent
+# llm-agent has no .py suffix, so the loader must be named explicitly.
+spec = importlib.util.spec_from_loader(
+    "llm_agent",
+    importlib.machinery.SourceFileLoader("llm_agent", str(HERE / "llm-agent")))
+agent = importlib.util.module_from_spec(spec)
+sys.argv = ["llm-agent", "noop"]           # module parses args only under __main__
+spec.loader.exec_module(agent)
+
+PASS, FAIL = "\033[32mPASS\033[0m", "\033[31mFAIL\033[0m"
+results = []
+
+
+def case(name, armed, edits, elapsed_s, floor_min, expect_block):
+    sid = f"test-{uuid.uuid4().hex[:8]}"
+    os.environ["WHIP_MIN_WORK_SECONDS"] = str(floor_min * 60)
+
+    # arm (or not) exactly the way llm-agent does — via the hook's own string match
+    agent.hook("start", {"session_id": sid,
+                         "prompt": "whip it good" if armed else "just do the thing"})
+
+    # backdate the start stamp to simulate a run of `elapsed_s`
+    stamp = pathlib.Path(f"/tmp/.whip-start-{sid}")
+    stamp.write_text(str(int(time.time()) - elapsed_s))
+
+    t = agent.Transcript(sid)
+    for _ in range(edits):
+        t.tool_use("Write")
+
+    reason = agent.hook("stop", {"session_id": sid, "transcript_path": str(t.path)})
+    blocked = reason is not None
+    ok = blocked == expect_block
+    results.append(ok)
+    print(f"  {PASS if ok else FAIL}  {name}")
+    print(f"        armed={armed} edits={edits} elapsed={elapsed_s}s floor={floor_min}m "
+          f"→ {'BLOCKED' if blocked else 'allowed'} (expected "
+          f"{'BLOCKED' if expect_block else 'allowed'})")
+    for f in (stamp, pathlib.Path(f"/tmp/.whip-on-{sid}"),
+              pathlib.Path(f"/tmp/.whip-strike-{sid}"), t.path):
+        f.unlink(missing_ok=True)
+
+
+def strike_case():
+    """Second stop in the same run must always be allowed — one-strike, never a cage."""
+    sid = f"test-{uuid.uuid4().hex[:8]}"
+    os.environ["WHIP_MIN_WORK_SECONDS"] = "600"
+    agent.hook("start", {"session_id": sid, "prompt": "whip it good"})
+    pathlib.Path(f"/tmp/.whip-start-{sid}").write_text(str(int(time.time()) - 10))
+    t = agent.Transcript(sid)
+    t.tool_use("Write")
+    first = agent.hook("stop", {"session_id": sid, "transcript_path": str(t.path)})
+    second = agent.hook("stop", {"session_id": sid, "transcript_path": str(t.path)})
+    ok = first is not None and second is None
+    results.append(ok)
+    print(f"  {PASS if ok else FAIL}  one-strike only: 2nd stop always goes through")
+    print(f"        1st={'BLOCKED' if first else 'allowed'}  "
+          f"2nd={'BLOCKED' if second else 'allowed'}  (expected BLOCKED then allowed)")
+
+
+print(f"hook: {agent.HOOK}")
+print(f"exists: {agent.HOOK.exists()}\n")
+
+case("unarmed work run stays out of the way",   False, 3, 10,   45, False)
+case("armed + edited + under floor  → blocked", True,  3, 10,   10, True)
+case("armed + edited + over floor   → allowed", True,  3, 4000, 10, False)
+case("armed but no edits (chat turn) → allowed", True, 0, 10,   10, False)
+strike_case()
+
+print(f"\n{sum(results)}/{len(results)} passed")
+sys.exit(0 if all(results) else 1)

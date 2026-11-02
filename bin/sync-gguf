@@ -1,0 +1,41 @@
+#!/usr/bin/env bash
+# Rebuilds llm-stack/gguf/ as a flat symlink farm of every GGUF on this box,
+# pulled from the LM Studio store (models/) and the Ollama blob store (ollama/).
+# Safe to re-run any time — it only ever touches llm-stack/gguf/.
+set -euo pipefail
+
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+OUT="$ROOT/gguf"
+
+rm -rf "$OUT"
+mkdir -p "$OUT"
+
+# --- LM Studio / manually downloaded GGUFs -----------------------------------
+while IFS= read -r -d '' f; do
+  rel="${f#"$ROOT/models/"}"
+  name="$(basename "$f")"
+  ln -sfn "$f" "$OUT/$name"
+done < <(find "$ROOT/models" -name '*.gguf' -print0)
+
+# --- Ollama blobs (content-addressed; manifest gives the friendly name) -------
+MAN="$ROOT/ollama/manifests/registry.ollama.ai"
+if [ -d "$MAN" ]; then
+  while IFS= read -r -d '' m; do
+    tag="${m#"$MAN"/}"                 # library/deepseek-coder-v2/16b
+    name="$(echo "$tag" | sed 's|^library/||; s|/|-|g')"
+    digest="$(python3 -c "
+import json,sys
+d=json.load(open(sys.argv[1]))
+for l in d['layers']:
+    if l['mediaType']=='application/vnd.ollama.image.model':
+        print(l['digest']); break
+" "$m")"
+    [ -n "$digest" ] || continue
+    blob="$ROOT/ollama/blobs/${digest/:/-}"
+    [ -f "$blob" ] || continue
+    ln -sfn "$blob" "$OUT/ollama-${name}.gguf"
+  done < <(find "$MAN" -type f -print0)
+fi
+
+echo "GGUF models linked in $OUT:"
+ls -lL "$OUT" | awk 'NR>1 {printf "  %-55s %s\n", $NF, $5}' | sed "s|$OUT/||"
