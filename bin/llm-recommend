@@ -118,7 +118,14 @@ def budget_gb(ram_gb, busy, cfg, ctx_k=8):
 
 
 def pick(ram_gb, busy, data):
-    """Highest tier this machine clears, plus the headroom calculation."""
+    """Highest tier this machine clears, plus the headroom calculation.
+
+    Returns (tier, budget, downgraded_from). The caller must still compare
+    tier["disk_gb"] against budget: on a machine too small for anything in the
+    table, the smallest tier is returned and it still will not fit. Returning
+    a model that cannot load without saying so is the worst outcome here, so
+    `fits()` below exists and the report uses it.
+    """
     tiers = sorted(data["tiers"], key=lambda t: t["min_ram_gb"])
     chosen = tiers[0]
     for t in tiers:
@@ -132,7 +139,14 @@ def pick(ram_gb, busy, data):
         for t in reversed(tiers):
             if t["disk_gb"] <= budget:
                 return t, budget, chosen
+        # Nothing in the table fits. Hand back the smallest and flag the
+        # step-down so the caller cannot mistake this for a clean choice.
+        return tiers[0], budget, chosen
     return chosen, budget, None
+
+
+def fits(tier, budget):
+    return tier["disk_gb"] <= budget
 
 
 def stale_days(data):
@@ -179,7 +193,14 @@ def report(d, data):
         for line in _wrap(tier["note"], 68):
             print("    " + line)
 
-    if downgraded:
+    if not fits(tier, budget):
+        print()
+        print("  ✗ NOTHING IN THE TABLE FITS THIS MACHINE.")
+        print("    The smallest option needs {} GB and the budget is {} GB.".format(
+            tier["disk_gb"], budget))
+        print("    Close other apps and re-run, or accept that this Mac is below")
+        print("    the floor for local inference. It is not a config problem.")
+    elif downgraded:
         print()
         print("  ⚠ stepped down from {} — it needs {} GB but the budget is {} GB.".format(
             downgraded["primary"], downgraded["disk_gb"], budget))
@@ -247,6 +268,7 @@ def main():
             out["budget_gb"] = budget
             out["recommendation"] = tier
             out["downgraded_from"] = downgraded["primary"] if downgraded else None
+            out["fits"] = fits(tier, budget)
             out["disk_ok"] = (d["disk_free_gb"] is None
                               or d["disk_free_gb"] >= tier["disk_gb"] * 1.5)
         else:

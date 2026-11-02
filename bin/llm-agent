@@ -706,12 +706,14 @@ def run_turn(a, messages, state):
                      else " whip strike(s) — WHIP WAS DISABLED (hook missing)")
         tail = f"[{step + 1} steps, {strikes}{whip_note}"
         if a.verify:
-            ok, label, _ = run_verification(state["workdir"])
+            ok, label, output = run_verification(state["workdir"])
             if label:
                 tail += ", {}: {}".format(label, "PASS" if ok else "FAIL")
             elif missing_runner(state["workdir"]):
                 tail += ", tests present but NO RUNNER (pip install pytest)"
-            elif _:
+            elif output:
+                # label is None but a runner DID produce output — it ran and
+                # collected nothing. Distinct from "no tests exist".
                 tail += ", runner collected NOTHING (not verified)"
             else:
                 tail += ", no tests found"

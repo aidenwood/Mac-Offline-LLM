@@ -1,5 +1,7 @@
 # Mac-Offline-LLM
 
+[![ci](https://github.com/aidenwood/Mac-Offline-LLM/actions/workflows/ci.yml/badge.svg)](https://github.com/aidenwood/Mac-Offline-LLM/actions/workflows/ci.yml)
+
 Run a capable coding LLM entirely offline on an Apple-Silicon Mac. One command
 detects your hardware, picks a model that will actually fit, installs what's
 missing, and gives you an agentic coding loop with real tool use.
@@ -198,8 +200,14 @@ removes exactly the PATH wiring it added and leaves your models alone.
 ## Tests
 
 ```
-bin/test-whip        12 cases: whip, verify gate, context trimming
+bin/test-whip        13 cases: whip, verify gate, context trimming
+bin/test-recommend   30 cases: budget formula, tier selection, honesty
 ```
+
+`test-recommend` exercises RAM tiers this machine is not — 8 GB through 128 GB —
+because the sizing logic decides what a stranger downloads, and getting it wrong
+is invisible from the author's own box. It caught exactly that: an 8 GB Mac was
+being recommended a model that does not fit, with no warning.
 
 Whip cases SKIP (not FAIL) when the optional hook isn't installed. All Python
 targets **3.9.6** — stock macOS ships that, and PATH order decides whether you

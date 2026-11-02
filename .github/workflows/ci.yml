@@ -87,6 +87,9 @@ jobs:
           bin/test-whip | grep -q "whip cases skipped" || {
             echo "FAIL: whip cases should SKIP, not run"; exit 1; }
 
+      - name: Sizing logic across RAM tiers this runner is not
+        run: bin/test-recommend
+
       - name: --whip must WARN, never silently no-op
         run: |
           set -e

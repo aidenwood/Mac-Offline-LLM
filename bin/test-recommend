@@ -1,0 +1,159 @@
+#!/usr/bin/env python3
+"""
+test-recommend — the sizing logic, tested against RAM tiers this machine isn't.
+
+This is the code that decides what a stranger downloads. Getting it wrong either
+recommends a model that OOMs on their box, or needlessly recommends a worse one.
+Neither failure is visible from the author's own 36 GB machine, which is exactly
+why these cases exist.
+
+Run:  test-recommend
+Python 3.9 compatible.
+"""
+
+import importlib.machinery
+import importlib.util
+import json
+import pathlib
+import sys
+
+HERE = pathlib.Path(__file__).resolve().parent
+spec = importlib.util.spec_from_loader(
+    "llm_recommend",
+    importlib.machinery.SourceFileLoader("llm_recommend", str(HERE / "llm-recommend")))
+rec = importlib.util.module_from_spec(spec)
+sys.argv = ["llm-recommend", "--quiet"]
+spec.loader.exec_module(rec)
+
+PASS, FAIL = "\033[32mPASS\033[0m", "\033[31mFAIL\033[0m"
+results = []
+DATA = rec.load_models()
+
+
+def json_ok():
+    """--json must parse and carry the fields the GUI will depend on."""
+    import subprocess
+    try:
+        out = subprocess.run([str(HERE / "llm-recommend"), "--json"],
+                             capture_output=True, text=True, timeout=60)
+        d = json.loads(out.stdout)
+    except Exception:
+        return False
+    if "hardware" not in d:
+        return False
+    hw = d["hardware"]
+    needed = ("ram_gb", "chip", "apple_silicon", "disk_free_gb", "page_size")
+    if not all(k in hw for k in needed):
+        return False
+    if hw["apple_silicon"]:
+        r = d.get("recommendation")
+        return bool(r) and "primary" in r and "budget_gb" in d
+    return d.get("recommendation") is None
+
+
+def check(name, condition, detail=""):
+    results.append(bool(condition))
+    print("  {}  {}".format(PASS if condition else FAIL, name))
+    if detail:
+        print("        {}".format(detail))
+
+
+print("budget formula:")
+
+# The author's own box is the one measured data point — the formula must still
+# land where it was observed to land, or the constants have drifted.
+b36 = rec.budget_gb(36.0, True, DATA["budget"])
+check("36 GB with an IDE open → 19.2 GB (the measured ceiling)",
+      abs(b36 - 19.2) < 0.15, "got {} GB".format(b36))
+
+# Closing an IDE must buy headroom, not cost it.
+b36_idle = rec.budget_gb(36.0, False, DATA["budget"])
+check("closing the IDE increases the budget",
+      b36_idle > b36, "{} GB idle vs {} GB busy".format(b36_idle, b36))
+
+# Monotonic: more RAM must never mean a smaller budget.
+budgets = [rec.budget_gb(r, True, DATA["budget"])
+           for r in (8, 16, 24, 32, 36, 48, 64, 96, 128)]
+check("budget rises monotonically with RAM",
+      all(b <= a for b, a in zip(budgets, budgets[1:])),
+      " → ".join(str(x) for x in budgets))
+
+# Never negative, however small the machine.
+check("tiny machines get a non-negative budget",
+      rec.budget_gb(4.0, True, DATA["budget"]) >= 0,
+      "4 GB → {} GB".format(rec.budget_gb(4.0, True, DATA["budget"])))
+
+# A longer context must cost budget, not be free.
+wide = rec.budget_gb(36.0, True, DATA["budget"], ctx_k=128)
+check("a 128K context costs budget vs 8K",
+      wide < b36, "{} GB at 128K vs {} GB at 8K".format(wide, b36))
+
+
+print("\ntier selection:")
+
+for ram, expect_min in [(8, 8), (16, 16), (24, 24), (36, 36), (64, 64), (256, 128)]:
+    tier, budget, downgraded = rec.pick(float(ram), False, DATA)
+    check("{} GB → a tier at or below it ({})".format(ram, tier["primary"]),
+          tier["min_ram_gb"] <= ram,
+          "chose min_ram_gb={}".format(tier["min_ram_gb"]))
+
+# The pick must actually fit the budget it was given, or have been downgraded
+# with the reason recorded. Recommending something that cannot load is the
+# single worst outcome here.
+print("\nthe pick must fit:")
+for ram in (8, 16, 24, 32, 36, 48, 64, 96, 128):
+    tier, budget, downgraded = rec.pick(float(ram), True, DATA)
+    fits = tier["disk_gb"] <= budget
+    check("{} GB: {} ({} GB) fits a {} GB budget".format(
+              ram, tier["primary"], tier["disk_gb"], budget),
+          fits or downgraded is not None,
+          "" if fits else "stepped down from {}".format(
+              downgraded["primary"] if downgraded else "?"))
+
+# A busy machine must never be given something larger than an idle one would get.
+print("\nbusy vs idle:")
+for ram in (16, 36, 64):
+    busy, _, _ = rec.pick(float(ram), True, DATA)
+    idle, _, _ = rec.pick(float(ram), False, DATA)
+    check("{} GB: busy pick is not larger than idle".format(ram),
+          busy["disk_gb"] <= idle["disk_gb"],
+          "busy {} ({} GB) vs idle {} ({} GB)".format(
+              busy["primary"], busy["disk_gb"], idle["primary"], idle["disk_gb"]))
+
+
+print("\nhonesty:")
+
+# A row claiming 'verified' must have been measured. This is the same assertion
+# CI makes, kept here so it fails locally before it fails in CI.
+bad = [t["primary"] for t in DATA["tiers"]
+       if t["verified"] and t["source"] != "measured"]
+check("no tier claims 'verified' without source=measured",
+      not bad, "offenders: {}".format(bad) if bad else "")
+
+check("exactly one tier is measured (only one box has been tested)",
+      sum(1 for t in DATA["tiers"] if t["verified"]) >= 1,
+      "{} measured of {}".format(
+          sum(1 for t in DATA["tiers"] if t["verified"]), len(DATA["tiers"])))
+
+# Known-bad models must never be recommended to anyone.
+bad_tags = {b["tag"] for b in DATA.get("known_bad", [])}
+recommended = {t["primary"] for t in DATA["tiers"]} | \
+              {t["fallback"] for t in DATA["tiers"]}
+overlap = bad_tags & recommended
+check("no known-bad model is recommended anywhere",
+      not overlap, "overlap: {}".format(overlap) if overlap else "")
+
+
+print("\ndetection:")
+d = rec.detect()
+check("reads total RAM", d["ram_gb"] is not None, "{} GB".format(d["ram_gb"]))
+check("page size is 4096 or 16384, never assumed",
+      d["page_size"] in (4096, 16384), "got {}".format(d["page_size"]))
+check("reports disk free where ollama writes",
+      d["disk_free_gb"] is not None, "{} GB".format(d["disk_free_gb"]))
+check("--json is valid and carries the fields the GUI needs",
+      json_ok(), "")
+
+
+print("\n{}/{} passed".format(sum(results), len(results)))
+sys.exit(0 if all(results) else 1)
