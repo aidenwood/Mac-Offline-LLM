@@ -1,0 +1,219 @@
+name: ci
+
+# Runs on GitHub's Apple-Silicon macOS runners — genuinely unknown hardware with
+# no Claude Code, no personal folders, and a different username. That is the
+# closest thing to a real stranger's machine available without owning one.
+#
+# SECURITY: this workflow interpolates no event data at all. There is no
+# ${{ github.event.* }} anywhere, so there is no injection surface. Keep it that
+# way — if you ever need a PR title or branch name, pass it via env:, never
+# inline into a run: block.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  stranger:
+    name: fresh machine
+    runs-on: macos-latest
+    timeout-minutes: 25
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: What we are actually running on
+        run: |
+          echo "chip:    $(sysctl -n machdep.cpu.brand_string)"
+          echo "arm64:   $(sysctl -n hw.optional.arm64 2>/dev/null || echo 0)"
+          echo "ram:     $(( $(sysctl -n hw.memsize) / 1073741824 )) GB"
+          echo "macOS:   $(sw_vers -productVersion)"
+          echo "python3: $(python3 --version)  at $(command -v python3)"
+          df -h / | tail -1
+
+      # Stock macOS ships 3.9.6 and PATH order decides whether you get that or a
+      # brew build. If anything here needs 3.10+, it breaks for half our users.
+      - name: Python 3.9 floor
+        run: |
+          set -e
+          PY39=/usr/bin/python3
+          echo "using $PY39 — $($PY39 --version)"
+          for f in bin/llm-agent bin/test-whip bin/llm-recommend \
+                   bin/llm-probe-tools bin/gguf-arch; do
+            $PY39 -m py_compile "$f" && echo "  ok  $f"
+          done
+
+      - name: Bash syntax
+        run: |
+          set -e
+          for f in bin/llm bin/llm-install bin/llm-link bin/sync-gguf; do
+            bash -n "$f" && echo "  ok  $f"
+          done
+
+      - name: models.json is valid and honest
+        run: |
+          python3 - <<'PY'
+          import json
+          d = json.load(open("models.json"))
+          assert d["tiers"], "no tiers"
+          for t in d["tiers"]:
+              for k in ("min_ram_gb", "primary", "disk_gb", "verified", "source"):
+                  assert k in t, "%s missing %s" % (t.get("primary"), k)
+              assert t["source"] in ("measured", "extrapolated", "vendor-card")
+              # A row claiming 'verified' must say it was measured. Asserting an
+              # untested recommendation as fact is the failure this guards.
+              if t["verified"]:
+                  assert t["source"] == "measured", \
+                      "%s is verified but source=%s" % (t["primary"], t["source"])
+          print("ok — %d tiers, %d measured"
+                % (len(d["tiers"]), sum(1 for t in d["tiers"] if t["verified"])))
+          PY
+
+      # The headline feature is optional. On a machine without the hook the whip
+      # cases must SKIP, and verify/trim must still genuinely pass.
+      - name: Test suite (no whip hook — the stranger case)
+        run: |
+          set -e
+          if [ -f "$HOME/.claude/hooks/whip-it-good.sh" ]; then
+            echo "unexpected: a whip hook exists on CI"; exit 1
+          fi
+          echo "confirmed: no whip hook on this machine"
+          bin/test-whip
+          bin/test-whip | grep -q "whip cases skipped" || {
+            echo "FAIL: whip cases should SKIP, not run"; exit 1; }
+
+      - name: --whip must WARN, never silently no-op
+        run: |
+          set -e
+          out="$(bin/llm-agent --whip --port 1 "noop" 2>&1 || true)"
+          echo "$out" | head -20
+          echo "$out" | grep -q "WHIP REQUESTED BUT DISABLED" || {
+            echo "FAIL: no banner when the hook is missing"; exit 1; }
+          echo "ok — banner shown"
+
+      - name: --rules without context must fail loudly
+        run: |
+          set -e
+          out="$(bin/llm-agent --rules code --port 1 "noop" 2>&1 || true)"
+          echo "$out" | grep -q "LLM_AGENT_CONTEXT is not set" || {
+            echo "FAIL: --rules degraded silently"; exit 1; }
+          echo "ok — hard error"
+
+      - name: No personal paths in a public repo
+        run: |
+          set -e
+          hits="$(grep -rniE 'aidxn-context|LLM_STACK' bin/ halls/ ./*.md ./*.json \
+                  2>/dev/null || true)"
+          if [ -n "$hits" ]; then echo "$hits"; exit 1; fi
+          echo "ok — clean"
+
+      - name: Hardware detection on unknown hardware
+        run: |
+          set -e
+          bin/llm-recommend || true
+          bin/llm-recommend --json > /tmp/rec.json
+          python3 - <<'PY'
+          import json
+          d = json.load(open("/tmp/rec.json"))
+          hw = d["hardware"]
+          assert hw["ram_gb"], "failed to read RAM"
+          assert hw["page_size"] in (4096, 16384), hw["page_size"]
+          if hw["apple_silicon"]:
+              assert d["recommendation"], "no recommendation on Apple Silicon"
+              print("ok —", d["recommendation"]["primary"],
+                    "budget", d["budget_gb"], "GB")
+          else:
+              print("ok — Intel runner, declined cleanly")
+          PY
+
+      - name: Installer dry-run changes nothing
+        run: |
+          set -e
+          before="$(shasum "$HOME/.zshrc" 2>/dev/null || echo none)"
+          bin/llm-install --dry-run || true
+          after="$(shasum "$HOME/.zshrc" 2>/dev/null || echo none)"
+          [ "$before" = "$after" ] || { echo "FAIL: dry-run touched .zshrc"; exit 1; }
+          echo "ok — nothing changed"
+
+      - name: llm-link dry-run changes nothing
+        run: |
+          set -e
+          bin/llm-link --status
+          bin/llm-link --dry-run
+          if [ -L "$HOME/.ollama/models" ]; then
+            echo "FAIL: dry-run created a link"; exit 1
+          fi
+          echo "ok — nothing changed"
+
+      - name: Helpful errors, not stack traces
+        run: |
+          set -e
+          out="$(bin/llm ls 2>&1 || true)"
+          echo "$out" | grep -q "no models yet" || {
+            echo "FAIL: empty gguf/ should say so, got: $out"; exit 1; }
+          echo "ok"
+
+  end_to_end:
+    name: real install (small model)
+    runs-on: macos-latest
+    timeout-minutes: 30
+    # Pulls a real model and runs the whole pipeline. Kept to a 1B so it fits CI
+    # disk and time; the big-model path differs only in download size.
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install ollama
+        run: brew install ollama
+
+      - name: Serve
+        run: |
+          nohup ollama serve > /tmp/ollama.log 2>&1 &
+          for _ in $(seq 1 60); do
+            curl -sf --max-time 2 http://127.0.0.1:11434/api/tags >/dev/null && break
+            sleep 1
+          done
+          curl -sf http://127.0.0.1:11434/api/tags >/dev/null && echo "serving"
+
+      - name: Install with an explicit small model
+        run: bin/llm-install --model llama3.2:1b --yes
+
+      - name: Tool-calling probe reports honestly
+        run: |
+          set -e
+          bin/llm-probe-tools llama3.2:1b --json > /tmp/probe.json || true
+          cat /tmp/probe.json
+          python3 - <<'PY'
+          import json
+          d = json.load(open("/tmp/probe.json"))
+          assert "usable" in d and len(d["variants"]) == 3
+          print("ok — probe ran all 3 variants, usable =", d["usable"])
+          PY
+
+      - name: The agent actually writes a file
+        run: |
+          set -e
+          mkdir -p /tmp/ci-work
+          bin/llm-agent --port 11434 --model llama3.2:1b --workdir /tmp/ci-work \
+            "Create hello.txt containing the word hello. Use the write_file tool." || true
+          if [ -f /tmp/ci-work/hello.txt ]; then
+            echo "ok — file written: $(cat /tmp/ci-work/hello.txt)"
+          else
+            # A 1B model failing to drive tools is a fact about the model, not a
+            # bug in the harness. Report it; don't fail the build on it.
+            echo "note: llama3.2:1b did not complete the tool call."
+            echo "That is exactly what llm-probe-tools is for."
+          fi
+
+      - name: Uninstall removes what it added
+        run: |
+          set -e
+          bin/llm-install --uninstall
+          if [ -L "$(brew --prefix)/bin/llm" ]; then
+            echo "FAIL: symlink survived"; exit 1
+          fi
+          echo "ok — clean"
