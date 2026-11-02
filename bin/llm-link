@@ -1,0 +1,146 @@
+#!/usr/bin/env bash
+# llm-link — point LM Studio and ollama at this project's model store, so there
+# is one copy of every model on the machine instead of three.
+#
+#   llm-link              do it (asks first, shows exactly what it will move)
+#   llm-link --dry-run    show the plan, change nothing
+#   llm-link --status     what is linked right now
+#   llm-link --undo       restore the original directories
+#
+# This touches OTHER applications' data directories, so it is deliberately NOT
+# part of `llm install`. Nothing is deleted: an existing store is MOVED into
+# this project and then symlinked back, so both apps keep working and --undo
+# reverses it exactly.
+set -uo pipefail
+
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+DRY=0; UNDO=0; STATUS=0; YES=0
+
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --dry-run) DRY=1 ;;
+    --undo)    UNDO=1 ;;
+    --status)  STATUS=1 ;;
+    --yes|-y)  YES=1 ;;
+    -h|--help) sed -n '2,15p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+    *)         echo "unknown option: $1" >&2; exit 2 ;;
+  esac
+  shift
+done
+
+ok()   { printf "  \033[32m✓\033[0m %s\n" "$*"; }
+warn() { printf "  \033[33m⚠\033[0m %s\n" "$*"; }
+bad()  { printf "  \033[31m✗\033[0m %s\n" "$*"; }
+
+# name : external path : where it lands inside this project
+STORES="lmstudio:$HOME/.lmstudio/models:$ROOT/models
+ollama:$HOME/.ollama/models:$ROOT/ollama"
+
+human() {   # bytes-ish size of a path, or "-"
+  [ -e "$1" ] && du -sh "$1" 2>/dev/null | cut -f1 || echo "-"
+}
+
+show_status() {
+  echo
+  echo "  store      state"
+  echo "$STORES" | while IFS=: read -r name ext internal; do
+    if [ -L "$ext" ]; then
+      target="$(readlink "$ext")"
+      if [ "$target" = "$internal" ]; then
+        printf "  %-10s linked here  (%s)\n" "$name" "$(human "$internal")"
+      else
+        printf "  %-10s linked ELSEWHERE → %s\n" "$name" "$target"
+      fi
+    elif [ -d "$ext" ]; then
+      printf "  %-10s separate directory  (%s)\n" "$name" "$(human "$ext")"
+    else
+      printf "  %-10s not present\n" "$name"
+    fi
+  done
+  echo
+}
+
+if [ "$STATUS" = 1 ]; then show_status; exit 0; fi
+
+# ── undo ───────────────────────────────────────────────────────────────────
+if [ "$UNDO" = 1 ]; then
+  echo
+  echo "  Restoring original store locations"
+  echo "$STORES" | while IFS=: read -r name ext internal; do
+    if [ -L "$ext" ] && [ "$(readlink "$ext")" = "$internal" ]; then
+      if [ "$DRY" = 1 ]; then
+        echo "      would: rm $ext ; mv $internal $ext"
+      else
+        rm -f "$ext"
+        if [ -d "$internal" ]; then
+          mv "$internal" "$ext" && ok "$name restored to $ext"
+        else
+          mkdir -p "$ext" && ok "$name — nothing to move, recreated $ext"
+        fi
+      fi
+    else
+      warn "$name is not linked here — left alone"
+    fi
+  done
+  echo
+  echo "  Run 'sync-gguf' is no longer meaningful for the moved stores."
+  exit 0
+fi
+
+# ── link ───────────────────────────────────────────────────────────────────
+echo
+echo "  Linking model stores into $ROOT"
+show_status
+
+PLAN=""
+echo "$STORES" | while IFS=: read -r name ext internal; do
+  if [ -L "$ext" ] && [ "$(readlink "$ext")" = "$internal" ]; then
+    ok "$name already linked"
+  elif [ -L "$ext" ]; then
+    bad "$name is a symlink to somewhere else ($(readlink "$ext")) — not touching it"
+  elif [ -d "$ext" ]; then
+    echo "      $name: move $ext ($(human "$ext")) → $internal, then symlink back"
+  elif [ -d "$internal" ]; then
+    echo "      $name: create symlink $ext → $internal"
+  else
+    echo "      $name: create $internal and symlink $ext → it"
+  fi
+done
+
+if [ "$DRY" = 1 ]; then
+  echo
+  echo "  (dry run — nothing changed)"
+  exit 0
+fi
+
+echo
+echo "  Both apps keep working: the data is MOVED, never deleted, and"
+echo "  'llm-link --undo' reverses it exactly."
+if [ "$YES" != 1 ] && [ -t 0 ]; then
+  printf "  Proceed? [y/N] "
+  read -r reply </dev/tty
+  case "$reply" in [yY]*) ;; *) echo "  cancelled"; exit 0 ;; esac
+fi
+
+# Same-volume moves are instant; a cross-volume move would copy 75GB, so refuse.
+echo "$STORES" | while IFS=: read -r name ext internal; do
+  [ -L "$ext" ] && continue
+  if [ -d "$ext" ]; then
+    if [ "$(stat -f %d "$ext" 2>/dev/null)" != "$(stat -f %d "$ROOT" 2>/dev/null)" ]; then
+      bad "$name is on a different volume — moving it would copy, not rename."
+      echo "      Skipped. Move it yourself if you really want to."
+      continue
+    fi
+    rm -rf "$internal"
+    mv "$ext" "$internal" || { bad "$name move failed"; continue; }
+  else
+    mkdir -p "$internal"
+  fi
+  mkdir -p "$(dirname "$ext")"
+  ln -sfn "$internal" "$ext" && ok "$name → $internal"
+done
+
+echo
+"$ROOT/bin/sync-gguf" 2>/dev/null | head -1
+echo
+echo "  Done. 'llm-link --status' to check, '--undo' to reverse."

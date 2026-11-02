@@ -145,7 +145,17 @@ readable names. If you point `~/.lmstudio/models` and `~/.ollama/models` at this
 project's `models/` and `ollama/` directories, every tool reads the same files
 and you stop keeping three copies of a 20 GB model.
 
-That symlinking is yours to do — the installer doesn't touch other apps' config.
+```bash
+llm link --status     # what's linked now
+llm link --dry-run    # the plan, no changes
+llm link              # do it
+llm link --undo       # reverse it exactly
+```
+
+Kept out of `llm install` on purpose, because it touches other applications' data
+directories. Nothing is deleted — an existing store is **moved** into this project
+and symlinked back, so both apps keep working, and a cross-volume move is refused
+rather than silently copying 75 GB.
 
 ---
 
@@ -169,6 +179,8 @@ That symlinking is yours to do — the installer doesn't touch other apps' confi
 
 ```
 llm install [--dry-run] [--model TAG] [--yes] [--uninstall]
+llm link [--status] [--dry-run] [--undo]
+llm recommend / llm probe <model>
 llm up [tag] / llm down / llm status
 llm chat / llm agent "task"
 llm ls / llm run / llm ask / llm serve / llm bench
