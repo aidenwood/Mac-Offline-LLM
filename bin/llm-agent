@@ -312,8 +312,21 @@ def missing_runner(workdir):
     return bool(has_py) and detect_test_command(workdir) is None
 
 
+# A runner that collected nothing still exits 0 and prints "Ran 0 tests ... OK".
+# Counting that as a pass is worse than having no gate at all: it is a green
+# light on an empty run. It fires exactly when the fallback runner is wrong for
+# the project — unittest cannot collect pytest-style bare `def test_x()`
+# functions — which is precisely when verification must not be claimed.
+_RAN_NOTHING = re.compile(r"Ran 0 tests|no tests ran|collected 0 items", re.I)
+
+
 def run_verification(workdir):
-    """Run the project's tests. Returns (ok, label, output). ok=True if none found."""
+    """Run the project's tests.
+
+    Returns (ok, label, output). **label is None means nothing was verified** —
+    no tests, no runner, or a runner that collected nothing. Callers must never
+    report a pass when label is None.
+    """
     found = detect_test_command(workdir)
     if not found:
         return True, None, ""
@@ -324,6 +337,10 @@ def run_verification(workdir):
     except Exception as e:
         return False, label, f"could not run {label}: {e}"
     out = ((p.stdout or "") + (p.stderr or ""))[-4000:]
+
+    if _RAN_NOTHING.search(out):
+        return True, None, out          # collected nothing — not a pass
+
     return p.returncode == 0, label, out
 
 
@@ -668,6 +685,11 @@ def run_turn(a, messages, state):
             elif missing_runner(state["workdir"]):
                 print("\n\u26a0 VERIFY: tests exist but no runner is installed "
                       "(pip install pytest) — not verified", file=sys.stderr)
+            elif out:
+                # A runner ran and collected nothing. Never silent: an empty
+                # green run is the most misleading result available.
+                print("\n\u26a0 VERIFY: the test runner collected nothing — "
+                      "NOT verified", file=sys.stderr)
 
         if reason:
             strikes += 1
@@ -689,6 +711,8 @@ def run_turn(a, messages, state):
                 tail += ", {}: {}".format(label, "PASS" if ok else "FAIL")
             elif missing_runner(state["workdir"]):
                 tail += ", tests present but NO RUNNER (pip install pytest)"
+            elif _:
+                tail += ", runner collected NOTHING (not verified)"
             else:
                 tail += ", no tests found"
         print("\n" + tail + "]", file=sys.stderr)

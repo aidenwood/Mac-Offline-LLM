@@ -29,6 +29,27 @@ PASS, FAIL = "\033[32mPASS\033[0m", "\033[31mFAIL\033[0m"
 SKIP = "\033[33mSKIP\033[0m"
 results = []
 
+# Written as unittest.TestCase so that BOTH pytest and unittest can collect
+# them. A bare `def test_x()` is a pytest idiom; unittest silently collects
+# nothing from it, which is the trap these very tests exist to catch.
+PASSING_TEST = """import unittest
+
+
+class T(unittest.TestCase):
+    def test_passes(self):
+        self.assertEqual(1 + 1, 2)
+"""
+
+FAILING_TEST = """import unittest
+
+from app import greet
+
+
+class T(unittest.TestCase):
+    def test_greeting(self):
+        self.assertEqual(greet(), 'Hello, World!')
+"""
+
 # The whip hook is OPTIONAL. Without it those cases are untestable, not failing —
 # reporting FAIL for a feature the user never installed is a guard crying wolf.
 HAVE_HOOK = agent.WHIP_AVAILABLE
@@ -94,59 +115,69 @@ def verify_cases():
     import shutil
     import tempfile
 
-    # Stock macOS has no pytest. Without a runner these cases are untestable,
-    # not failing — and the code under test must say "no runner", never "tests
-    # failed", or --verify sends the model to fix a missing dependency.
     probe = pathlib.Path(tempfile.mkdtemp(prefix="probe-"))
-    (probe / "test_x.py").write_text("def test_a():\n    assert 1\n")
-    have_runner = agent.detect_test_command(probe) is not None
-    runner = agent.detect_test_command(probe)
+    (probe / "test_x.py").write_text(PASSING_TEST)
+    found = agent.detect_test_command(probe)
     shutil.rmtree(probe, ignore_errors=True)
-    if not have_runner:
-        for name in ("no tests found → run is allowed through",
-                     "passing tests → allowed",
-                     "code changed under its test → BLOCKED"):
+
+    if found is None:
+        # No runner at all. The cases are untestable, but the DISTINCTION
+        # between "no runner" and "tests failed" still is, and it is the whole
+        # point — otherwise --verify sends the model to fix a missing dep.
+        for name in ("no tests found -> allowed", "passing tests -> allowed",
+                     "code changed under its test -> BLOCKED"):
             print(f"  {SKIP}  {name}")
             print("        no test runner installed (pip install pytest)")
-        # The one thing that IS testable without a runner: the distinction.
         d = pathlib.Path(tempfile.mkdtemp(prefix="norunner-"))
-        (d / "test_x.py").write_text("def test_a():\n    assert 1\n")
+        (d / "test_x.py").write_text(PASSING_TEST)
         r = agent.missing_runner(d)
         results.append(r)
-        print(f"  {PASS if r else FAIL}  tests present + no runner → reported as "
-              f"'no runner', not 'failed'")
+        print(f"  {PASS if r else FAIL}  tests present + no runner -> reported "
+              f"as 'no runner', not 'failed'")
         shutil.rmtree(d, ignore_errors=True)
         return
-    print(f"        using {runner[1]}")
 
+    label_expected = found[1]
+    print(f"        runner: {label_expected}")
     root = pathlib.Path(tempfile.mkdtemp(prefix="verify-"))
 
-    # 1. no tests at all → ok, nothing to gate on
+    # 1. no tests at all -> nothing to gate on
     ok, label, _ = agent.run_verification(root)
     r1 = ok and label is None
     results.append(r1)
-    print(f"  {PASS if r1 else FAIL}  no tests found → run is allowed through")
+    print(f"  {PASS if r1 else FAIL}  no tests found -> run is allowed through")
 
-    # 2. a passing test → ok
-    (root / "test_ok.py").write_text("def test_x():\n    assert 1 + 1 == 2\n")
-    ok, label, _ = agent.run_verification(root)
-    r2 = ok and label == "pytest"
-    results.append(r2)
-    print(f"  {PASS if r2 else FAIL}  passing tests → allowed  (label={label})")
-
-    # 3. the exact failure mode seen in the wild: code changed under its own test
-    (root / "app.py").write_text("def greet():\n    return 'Hello, World! Welcome.'\n")
-    (root / "test_ok.py").write_text(
-        "from app import greet\n\n\ndef test_greet():\n"
-        "    assert greet() == 'Hello, World!'\n")
+    # 2. a passing test -> allowed, and named by whichever runner was chosen
+    (root / "test_ok.py").write_text(PASSING_TEST)
     ok, label, out = agent.run_verification(root)
-    r3 = (not ok) and label == "pytest" and "assert" in out.lower()
+    r2 = ok and label == label_expected
+    results.append(r2)
+    print(f"  {PASS if r2 else FAIL}  passing tests -> allowed  "
+          f"(label={label}, expected {label_expected})")
+
+    # 3. the failure seen in the wild: code changed out from under its own test
+    (root / "app.py").write_text("def greet():\n    return 'Hello, World! Welcome.'\n")
+    (root / "test_ok.py").write_text(FAILING_TEST)
+    ok, label, out = agent.run_verification(root)
+    r3 = (not ok) and label == label_expected
     results.append(r3)
-    print(f"  {PASS if r3 else FAIL}  code changed under its test → BLOCKED, "
-          f"failure captured ({len(out)} chars)")
+    print(f"  {PASS if r3 else FAIL}  code changed under its test -> BLOCKED "
+          f"({len(out)} chars captured)")
+
+    # 4. a runner that collects NOTHING must not report a pass. Claiming green
+    #    on an empty run is worse than having no gate.
+    empty = pathlib.Path(tempfile.mkdtemp(prefix="empty-"))
+    (empty / "test_uncollectable.py").write_text(
+        "# deliberately contains no test this runner can collect\n"
+        "def helper():\n    return 1\n")
+    ok, label, out = agent.run_verification(empty)
+    r4 = label is None
+    results.append(r4)
+    print(f"  {PASS if r4 else FAIL}  runner collected nothing -> NOT counted "
+          f"as a pass (label={label})")
+    shutil.rmtree(empty, ignore_errors=True)
 
     shutil.rmtree(root, ignore_errors=True)
-
 
 
 def trim_cases():
