@@ -112,6 +112,44 @@ curl -s localhost:8080/v1/chat/completions -H 'Content-Type: application/json' -
 A real `tool_calls` array in the response means the model is usable here. Prose means it
 is not.
 
+## Room: A `system` message silently breaks tool calling on ollama
+
+**Measured 2026-11-02. This one is nasty because it fails quietly.**
+
+With ollama's `qwen3-coder` template, adding a `system` role to a tools request makes the
+model stop emitting structured `tool_calls` and start emitting `<function=write_file>…`
+as plain **text**. The template injects the tool definitions into the system slot, so a
+user-supplied system message displaces them.
+
+Identical request, system message the only difference:
+
+| Request | `tool_calls` |
+|---|---|
+| user turn only | ✅ structured |
+| **system + user** | ❌ text, no tool calls |
+| system prompt folded into the user turn | ✅ structured |
+
+The consequence is the dangerous part. The loop sees no `tool_calls`, treats the response
+as a final answer, and the model reports *"I've created the hello.py file as requested"* —
+with no file on disk. **Rules in the system prompt turn the agent into a liar.**
+
+`llm-agent` therefore folds the system prompt into the first user turn automatically on
+`:11434`, and `--no-system` forces the same on any backend. Both the rules and the tools
+survive.
+
+If you add a backend, test it both ways before trusting it.
+
+## Room: Backends
+
+| Port | Backend | Notes |
+|---|---|---|
+| 8080 | `llm serve` (llama-server) | pins the model in wired memory until killed |
+| 11434 | `ollama serve` | **unloads idle models** — survives memory pressure far better; needs `--model` |
+
+On a machine that is tight on RAM, prefer `:11434`. `llama-server` holding an 18 GB model
+wired will lose to anything else that wants memory, and the only symptom is
+`Compute error`.
+
 ## Room: Testing
 
 `bin/test-whip` drives the real hook through `llm-agent`'s own code path with a synthetic

@@ -18,6 +18,7 @@ Usage
   llm-agent --whip --whip-minutes 10 "…"  shorter floor for local-model speeds
   llm-agent --rules code,comms "task"     load specific halls as system prompt
   llm-agent --port 8081 "task"            a different llama-server
+  llm-agent --port 11434 --model qwen3-coder:30b "task"   via ollama (unloads when idle)
 
 Arming matches the real hook: --whip literally puts "whip it good" in the prompt the
 hook sees, so the same string match that arms a Claude Code session arms this one.
@@ -201,19 +202,32 @@ def system_prompt(rules):
 
 # ────────────────────────────────── loop ───────────────────────────────────
 
-def chat(port, messages, use_tools=True):
+def chat(port, messages, model=None, use_tools=True):
+    # Ollama (:11434) requires a "model" field; llama-server ignores it. Sending it
+    # when known keeps one code path for both backends.
     body = {"messages": messages, "max_tokens": 2048}
+    if model:
+        body["model"] = model
     if use_tools:
         body["tools"] = TOOLS
     req = urllib.request.Request(
         f"http://localhost:{port}/v1/chat/completions",
         data=json.dumps(body).encode(), headers={"Content-Type": "application/json"})
     try:
-        with urllib.request.urlopen(req, timeout=600) as r:
+        with urllib.request.urlopen(req, timeout=900) as r:
             return json.load(r)["choices"][0]["message"]
+    except urllib.error.HTTPError as e:
+        detail = e.read().decode(errors="ignore")[:300]
+        if "model" in detail and port == 11434:
+            sys.exit(f"ollama needs --model (e.g. --model qwen3-coder:30b)\n{detail}")
+        sys.exit(f"backend error on :{port} — {detail}\n\n"
+                 "If this is llama-server reporting 'Compute error', it is out of memory: "
+                 "check for orphaned `llama-` processes holding models wired "
+                 "(ps -Ao pid,etime,rss,args | grep llama-), or use --port 11434 "
+                 "to route through ollama, which unloads idle models.")
     except urllib.error.URLError as e:
-        sys.exit(f"cannot reach llama-server on :{port} — start one with "
-                 f"`llm serve <model>`  ({e})")
+        sys.exit(f"cannot reach a server on :{port}. Start one with `llm serve <model>` "
+                 f"(:8080) or `ollama serve` (:11434).  ({e})")
 
 
 def main():
@@ -226,10 +240,16 @@ def main():
                          "Claude Code's default is 45)")
     ap.add_argument("--rules", default="",
                     help="comma-separated halls to load as system prompt, e.g. code,comms")
-    ap.add_argument("--port", type=int, default=int(os.environ.get("LLM_PORT", 8080)))
+    ap.add_argument("--port", type=int, default=int(os.environ.get("LLM_PORT", 8080)),
+                    help="8080 = llama-server (llm serve); 11434 = ollama")
+    ap.add_argument("--model", default=None,
+                    help="required on :11434 (ollama), e.g. qwen3-coder:30b")
     ap.add_argument("--workdir", default=os.getcwd())
     ap.add_argument("--max-steps", type=int, default=40)
     ap.add_argument("--yolo", action="store_true", help="allow arbitrary bash")
+    ap.add_argument("--no-system", action="store_true",
+                    help="fold the system prompt into the first user turn. Forced on "
+                         "ollama (:11434), where a system role breaks tool calling.")
     a = ap.parse_args()
 
     workdir = pathlib.Path(a.workdir).resolve()
@@ -247,12 +267,24 @@ def main():
     print(f"session {sid}  workdir {workdir}{env_note}", file=sys.stderr)
 
     rules = [r for r in a.rules.split(",") if r.strip()]
-    messages = [{"role": "system", "content": system_prompt(rules)},
-                {"role": "user", "content": a.task}]
+    sysmsg = system_prompt(rules)
+
+    # A `system` role SILENTLY BREAKS TOOL CALLING on ollama's qwen3-coder template:
+    # the template injects the tool definitions into the system slot, so a user-supplied
+    # system message displaces them and the model falls back to emitting
+    # `<function=…>` as plain TEXT. The loop then sees no tool_calls, treats it as a
+    # final answer, and the model cheerfully reports success for work it never did.
+    # Measured 2026-11-02 — identical request, system message the only difference.
+    # Folding the prompt into the first user turn keeps both the rules and the tools.
+    if a.no_system or a.port == 11434:
+        messages = [{"role": "user", "content": f"{sysmsg}\n\n---\n\n{a.task}"}]
+    else:
+        messages = [{"role": "system", "content": sysmsg},
+                    {"role": "user", "content": a.task}]
 
     strikes = 0
     for step in range(a.max_steps):
-        msg = chat(a.port, messages)
+        msg = chat(a.port, messages, a.model)
         messages.append(msg)
 
         calls = msg.get("tool_calls") or []

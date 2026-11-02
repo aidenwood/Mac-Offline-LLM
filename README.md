@@ -67,6 +67,23 @@ Tool calling must be **structured**. Measured 2026-11-02:
 That second one is the trap: it reports "file written successfully" and no file exists.
 Probe a model before trusting it in the loop — see `halls/agentic.md`.
 
+**And a `system` message breaks it too.** On ollama's qwen3-coder template, adding a
+`system` role to a tools request displaces the injected tool definitions and the model
+falls back to emitting `<function=…>` as text — so putting your rules in the system prompt
+silently turns the agent into a liar. `llm-agent` folds the system prompt into the first
+user turn on `:11434` for exactly this reason. Measured, not assumed.
+
+## Verified end to end
+
+```
+unwhipped →  hello.py                     model stops when the task is done
+whipped   →  hello.py + test_hello.py     tried to stop, hook blocked it,
+                                          it wrote the missing test and continued
+```
+
+The whipped run did what the hook's own text asks for — "name the next concrete task the
+work implies and do it: the missing test". A local 30B obeying a Claude Code rule.
+
 ## Tool safety
 
 Writes confined to `--workdir`. `bash` restricted to a read-only allowlist unless
