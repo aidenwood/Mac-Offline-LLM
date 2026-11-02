@@ -75,6 +75,12 @@ the real hook.
 ## Room: Long-running chat
 
 ```bash
+llm chat            # brings ollama up, loads the model, opens the session
+```
+
+which is shorthand for:
+
+```bash
 llm-agent --chat --yolo --unrestricted --port 11434 --model qwen3-coder:30b
 ```
 

@@ -3,6 +3,7 @@
 #
 #   llm up [tag]                 ONE COMMAND: daemon up, model resident, ready to work
 #   llm agent "task"             up, then run the whipped agentic loop against it
+#   llm chat                     up, then a long-running session: full shell, writes anywhere
 #   llm status                   what is running and what is holding memory
 #   llm down                     evict the resident model, free the wired RAM
 #
@@ -89,6 +90,7 @@ bring_up() {
 
   echo "✓ $tag ready on $OLLAMA  —  $(resident) GiB resident"
   echo "  llm agent \"your task\"      whipped agentic loop"
+  echo "  llm chat                    long-running session, full shell"
   echo "  llm down                    free the memory"
 }
 
@@ -99,6 +101,12 @@ case "$cmd" in
 
   agent)  bring_up "$AGENT_MODEL" >&2
           exec "$ROOT/bin/llm-agent" --whip --port 11434 --model "$AGENT_MODEL" "$@" ;;
+
+          # Long-running session with the lid off: arbitrary shell, writes anywhere.
+          # Machine-ending commands stay refused (see CATASTROPHIC in llm-agent).
+  chat)   bring_up "$AGENT_MODEL" >&2
+          exec "$ROOT/bin/llm-agent" --chat --yolo --unrestricted \
+                                     --port 11434 --model "$AGENT_MODEL" "$@" ;;
 
   status) if ollama_alive; then
             local_r=$(resident)

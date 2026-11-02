@@ -109,6 +109,57 @@ def verify_cases():
     shutil.rmtree(root, ignore_errors=True)
 
 
+
+def trim_cases():
+    """trim() must protect the rules head and never orphan a tool result."""
+    print("trim:")
+
+    head = {"role": "user", "content": "RULES: never fork a source of truth. " + "x" * 400}
+
+    # 1. a short conversation is left completely alone
+    short = [head, {"role": "user", "content": "hi"},
+             {"role": "assistant", "content": "hello"}]
+    out, dropped = agent.trim(list(short), 32768)
+    r1 = dropped == 0 and out == short
+    results.append(r1)
+    print(f"  {PASS if r1 else FAIL}  short conversation untouched (dropped={dropped})")
+
+    # 2. an overflowing conversation is trimmed, and the rules head SURVIVES
+    big = [head]
+    for i in range(400):
+        big.append({"role": "user", "content": f"turn {i} " + "y" * 600})
+        big.append({"role": "assistant", "content": f"reply {i} " + "z" * 600})
+    before = agent.approx_tokens(big)
+    out, dropped = agent.trim(list(big), 8192)
+    after = agent.approx_tokens(out)
+    r2 = dropped > 0 and out[0] == head and after < before
+    results.append(r2)
+    print(f"  {PASS if r2 else FAIL}  overflow trimmed, rules head kept "
+          f"({before}→{after} tok, dropped {dropped})")
+
+    # 3. it actually gets under the window it was given
+    r3 = after < 8192
+    results.append(r3)
+    print(f"  {PASS if r3 else FAIL}  result fits the context window "
+          f"({after} < 8192)")
+
+    # 4. no orphaned tool results — every `tool` msg still follows an assistant
+    convo = [head]
+    for i in range(300):
+        convo.append({"role": "assistant", "content": "", "tool_calls": [
+            {"id": f"c{i}", "type": "function",
+             "function": {"name": "read_file", "arguments": "{}"}}]})
+        convo.append({"role": "tool", "tool_call_id": f"c{i}",
+                      "content": "w" * 800})
+    out, _ = agent.trim(list(convo), 8192)
+    orphan = any(m.get("role") == "tool" and
+                 (i == 0 or out[i - 1].get("role") != "assistant")
+                 for i, m in enumerate(out))
+    r4 = not orphan
+    results.append(r4)
+    print(f"  {PASS if r4 else FAIL}  no tool result orphaned from its call")
+
+
 print(f"hook: {agent.HOOK}")
 print(f"exists: {agent.HOOK.exists()}\n")
 
@@ -120,6 +171,8 @@ case("armed but no edits (chat turn) → allowed", True, 0, 10,   10, False)
 strike_case()
 print()
 verify_cases()
+print()
+trim_cases()
 
 print(f"\n{sum(results)}/{len(results)} passed")
 sys.exit(0 if all(results) else 1)
