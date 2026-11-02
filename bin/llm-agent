@@ -43,6 +43,7 @@ import json
 import os
 import pathlib
 import re
+import shutil
 import subprocess
 import sys
 import urllib.error
@@ -268,19 +269,47 @@ def recover_text_tool_calls(content):
 # So run it. If the work produced tests, they have to pass before the run is allowed
 # to finish; a failure goes back to the model as the next task.
 
+def _have_module(name):
+    """Is this module importable by the interpreter we would actually use?"""
+    try:
+        return subprocess.run([sys.executable, "-c", "import " + name],
+                              capture_output=True, timeout=30).returncode == 0
+    except Exception:
+        return False
+
+
 def detect_test_command(workdir):
-    """Return (argv, label) for this project's tests, or None."""
-    if list(workdir.glob("test_*.py")) or list(workdir.glob("*_test.py")) \
-            or (workdir / "tests").is_dir():
-        return ([sys.executable, "-m", "pytest", "-q"], "pytest")
+    """Return (argv, label) for this project's tests, or None.
+
+    Returns None when the RUNNER is missing, not just when there are no tests.
+    Conflating the two is a real bug: a machine without pytest would otherwise
+    see "tests failed", and --verify would send the model off to fix a failure
+    that is actually a missing dependency. Stock macOS has no pytest.
+    """
+    has_py = (list(workdir.glob("test_*.py")) or list(workdir.glob("*_test.py"))
+              or (workdir / "tests").is_dir())
+    if has_py:
+        if _have_module("pytest"):
+            return ([sys.executable, "-m", "pytest", "-q"], "pytest")
+        if _have_module("unittest"):
+            return ([sys.executable, "-m", "unittest", "discover", "-q"], "unittest")
+        return None                      # tests exist but nothing can run them
+
     pkg = workdir / "package.json"
-    if pkg.exists():
+    if pkg.exists() and shutil.which("npm"):
         try:
             if "test" in (json.loads(pkg.read_text()).get("scripts") or {}):
                 return (["npm", "test", "--silent"], "npm test")
         except Exception:
             pass
     return None
+
+
+def missing_runner(workdir):
+    """True when tests are present but no runner is installed — worth saying."""
+    has_py = (list(workdir.glob("test_*.py")) or list(workdir.glob("*_test.py"))
+              or (workdir / "tests").is_dir())
+    return bool(has_py) and detect_test_command(workdir) is None
 
 
 def run_verification(workdir):
@@ -636,6 +665,9 @@ def run_turn(a, messages, state):
                 )
             elif label and ok:
                 print(f"\n\u2713 VERIFY ({label} passed)", file=sys.stderr)
+            elif missing_runner(state["workdir"]):
+                print("\n\u26a0 VERIFY: tests exist but no runner is installed "
+                      "(pip install pytest) — not verified", file=sys.stderr)
 
         if reason:
             strikes += 1
@@ -653,8 +685,12 @@ def run_turn(a, messages, state):
         tail = f"[{step + 1} steps, {strikes}{whip_note}"
         if a.verify:
             ok, label, _ = run_verification(state["workdir"])
-            tail += (f", {label}: {'PASS' if ok else 'FAIL'}" if label
-                     else ", no tests found")
+            if label:
+                tail += ", {}: {}".format(label, "PASS" if ok else "FAIL")
+            elif missing_runner(state["workdir"]):
+                tail += ", tests present but NO RUNNER (pip install pytest)"
+            else:
+                tail += ", no tests found"
         print("\n" + tail + "]", file=sys.stderr)
         return
 

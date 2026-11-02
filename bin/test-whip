@@ -93,6 +93,32 @@ def verify_cases():
     print("verify:")
     import shutil
     import tempfile
+
+    # Stock macOS has no pytest. Without a runner these cases are untestable,
+    # not failing — and the code under test must say "no runner", never "tests
+    # failed", or --verify sends the model to fix a missing dependency.
+    probe = pathlib.Path(tempfile.mkdtemp(prefix="probe-"))
+    (probe / "test_x.py").write_text("def test_a():\n    assert 1\n")
+    have_runner = agent.detect_test_command(probe) is not None
+    runner = agent.detect_test_command(probe)
+    shutil.rmtree(probe, ignore_errors=True)
+    if not have_runner:
+        for name in ("no tests found → run is allowed through",
+                     "passing tests → allowed",
+                     "code changed under its test → BLOCKED"):
+            print(f"  {SKIP}  {name}")
+            print("        no test runner installed (pip install pytest)")
+        # The one thing that IS testable without a runner: the distinction.
+        d = pathlib.Path(tempfile.mkdtemp(prefix="norunner-"))
+        (d / "test_x.py").write_text("def test_a():\n    assert 1\n")
+        r = agent.missing_runner(d)
+        results.append(r)
+        print(f"  {PASS if r else FAIL}  tests present + no runner → reported as "
+              f"'no runner', not 'failed'")
+        shutil.rmtree(d, ignore_errors=True)
+        return
+    print(f"        using {runner[1]}")
+
     root = pathlib.Path(tempfile.mkdtemp(prefix="verify-"))
 
     # 1. no tests at all → ok, nothing to gate on
@@ -106,7 +132,7 @@ def verify_cases():
     ok, label, _ = agent.run_verification(root)
     r2 = ok and label == "pytest"
     results.append(r2)
-    print(f"  {PASS if r2 else FAIL}  passing pytest → allowed  (label={label})")
+    print(f"  {PASS if r2 else FAIL}  passing tests → allowed  (label={label})")
 
     # 3. the exact failure mode seen in the wild: code changed under its own test
     (root / "app.py").write_text("def greet():\n    return 'Hello, World! Welcome.'\n")
