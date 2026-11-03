@@ -139,6 +139,33 @@ rather than a silent no-op.
 
 ---
 
+## Faster decisions, not another chat model
+
+Several things here were decided by a regex standing in for judgement. A regex
+cannot tell `rm -rf ./build` from `rm -rf "$BUILD_DIR"` when the variable is
+unset. A chat model can — at the cost of seconds, at a point in the loop that
+has to be fast.
+
+[Jev](https://jevai.dev) sits in between: you enumerate the answers, it returns
+a typed one in ~150ms. `bin/jev` wires it into the three decisions that needed
+judgement — shell safety, did-it-finish-or-give-up, and which model size a task
+actually needs.
+
+```bash
+export OPENROUTER_API_KEY=...
+llm jev status
+llm jev --selftest       # proves the fallbacks, no key needed
+```
+
+**It is optional and the fallbacks are the point.** This is an offline tool, so
+every decision keeps the deterministic rule that was there before; it runs when
+there is no key, no network, or a timeout, and the result always reports which
+one answered. A Jev outage can make the judgement coarser — it can never change
+what the tool is willing to do. The regex also runs first on shell commands and
+can only be escalated, never overruled.
+
+Detail, including where NOT to use it: [halls/decisions.md](halls/decisions.md).
+
 ## One model store
 
 `bin/sync-gguf` builds a flat `gguf/` symlink farm from both the LM Studio and
@@ -202,6 +229,7 @@ removes exactly the PATH wiring it added and leaves your models alone.
 ```
 bin/test-whip        13 cases: whip, verify gate, context trimming
 bin/test-recommend   30 cases: budget formula, tier selection, honesty
+bin/jev --selftest    6 cases: every decision falls back with no key
 ```
 
 `test-recommend` exercises RAM tiers this machine is not — 8 GB through 128 GB —

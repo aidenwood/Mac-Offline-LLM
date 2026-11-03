@@ -191,6 +191,18 @@ TOOLS = [
 
 WRITERS = {"write_file", "edit_file"}
 
+# Optional. jev adds judgement to decisions a regex can only approximate; when
+# it is missing, unconfigured or offline, every call falls back to the regex
+# that was here before it. Importing it must never be able to break the agent.
+try:
+    import importlib.machinery as _m, importlib.util as _u
+    _spec = _u.spec_from_loader("jev", _m.SourceFileLoader(
+        "jev", str(pathlib.Path(__file__).resolve().parent / "jev")))
+    jev = _u.module_from_spec(_spec)
+    _spec.loader.exec_module(jev)
+except Exception:
+    jev = None
+
 # Refused even under --yolo. Not a security boundary — a local model with shell access
 # can do anything it likes. This only stops the handful of commands that end the
 # machine rather than the session, which a 30B has no judgement about and will
@@ -379,7 +391,22 @@ def run_tool(name, args, workdir, yolo, transcript, unrestricted=False):
 
         if name == "bash":
             cmd = args["command"]
-            if CATASTROPHIC.search(cmd):
+            regex_verdict = "catastrophic" if CATASTROPHIC.search(cmd) else "safe"
+
+            # A regex cannot read intent: `rm -rf "$BUILD_DIR"` is harmless
+            # until BUILD_DIR is unset, and no pattern distinguishes those.
+            # jev can, in ~150ms. It may ESCALATE what the regex waved
+            # through; it can never de-escalate a pattern match, because a
+            # known-bad command should not be argued out of a refusal by a
+            # probabilistic model.
+            verdict = regex_verdict
+            if jev is not None and yolo:
+                verdict, conf, used = jev.judge_command(cmd, regex_verdict)
+                if used not in ("no-key", "regex-override") and verdict != regex_verdict:
+                    print("  (jev: {} → {}, conf {:.2f})".format(
+                        regex_verdict, verdict, conf), file=sys.stderr)
+
+            if verdict == "catastrophic":
                 return ("REFUSED: that command destroys the machine, not the session. "
                         "Refused even under --yolo. If you genuinely need it, the "
                         "operator runs it manually.")
@@ -652,7 +679,20 @@ def run_turn(a, messages, state):
         # through as a "conversational turn". One forced retry, then it goes through.
         if reason is None and a.whip and not question_strike[0]:
             body = msg.get("content") or ""
-            if not wrote_anything[0] and ASKED_A_QUESTION.search(body):
+            asked = bool(ASKED_A_QUESTION.search(body))
+
+            # The regex is a phrase list; it cannot tell "finished a small job"
+            # from "gave up". jev decides between finished/asked/partial/
+            # blocked, which is the judgement the phrase list was always
+            # approximating. Falls back to the regex verdict when unavailable.
+            if jev is not None and not wrote_anything[0]:
+                verdict, conf, used = jev.judge_finished(body[:2000], asked)
+                if used not in ("no-key",):
+                    asked = verdict in ("asked", "partial")
+                    if verdict == "blocked":
+                        asked = False      # genuinely stuck is not a smoke break
+
+            if not wrote_anything[0] and asked:
                 question_strike[0] = True
                 reason = (
                     "You ended without building anything and asked a question instead. "

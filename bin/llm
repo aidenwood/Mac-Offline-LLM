@@ -3,6 +3,7 @@
 #
 #   llm install                  FIRST RUN: detect hardware, install deps, pull a model
 #   llm link                     one model store: point LM Studio + ollama here
+#   llm jev status|--selftest    typed decisions (optional; falls back offline)
 #   llm up [tag]                 daemon up, model resident, ready to work
 #   llm agent "task"             up, then run the whipped agentic loop against it
 #   llm chat                     up, then a long-running session: full shell, writes anywhere
@@ -121,6 +122,7 @@ case "$cmd" in
   install) exec "$ROOT/bin/llm-install" "$@" ;;
   link)    exec "$ROOT/bin/llm-link" "$@" ;;
   recommend) exec "$ROOT/bin/llm-recommend" "$@" ;;
+  jev)     exec "$ROOT/bin/jev" "$@" ;;
   probe)   exec "$ROOT/bin/llm-probe-tools" "$@" ;;
 
   up)     bring_up "${1:-$AGENT_MODEL}" ;;

@@ -90,6 +90,15 @@ jobs:
       - name: Sizing logic across RAM tiers this runner is not
         run: bin/test-recommend
 
+      - name: Decision fallbacks hold with no API key
+        run: |
+          set -e
+          if [ -n "${OPENROUTER_API_KEY:-}" ]; then
+            echo "FAIL: CI must prove the OFFLINE path"; exit 1
+          fi
+          bin/jev status
+          bin/jev --selftest
+
       - name: --whip must WARN, never silently no-op
         run: |
           set -e
