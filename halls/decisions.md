@@ -95,6 +95,58 @@ refuses it and nothing Jev returns can change that, so paying ~300ms and
 tokens to discard the answer was waste. Pay for a decision only where it can
 change the outcome.
 
+## Room: Routing — one endpoint, three tiers
+
+`bin/llm-router` is an OpenAI-compatible endpoint on :8099. Point anything at it
+— Continue.dev, Aider, `llm-agent`, a cron job — and stop choosing a model by
+hand.
+
+```
+  local-small  →  claude  →  local-large
+  (ollama)        (claude -p)   (ollama, the floor)
+```
+
+**Classification routes UP; availability routes DOWN.** Those are different kinds
+of question and must not share a mechanism. "Is this task big enough to need a
+capable model?" is a judgement — jev answers it. "Is that tier reachable right
+now?" is a fact about the world, and must never depend on a network call to
+establish.
+
+**Demote on failure, never on a guess.** Nothing in Claude Code exposes remaining
+quota, so exhaustion is detected by a call failing and matching a marker in
+`router-tiers.json`. One slow request is the honest price of having no signal to
+read — predicting it would mean demoting while the good path still worked.
+
+A demotion **expires** (30 min default). Permanent demotion would let one blip
+cost the subscription path for the rest of the day.
+
+### The billing guard
+
+`claude -p` bills the **Claude Code subscription** — but only while
+`ANTHROPIC_API_KEY` is absent from its environment. With the key set the call
+still succeeds, so the mistake is invisible until the invoice. The router strips
+`ANTHROPIC_API_KEY`, `ANTHROPIC_AUTH_TOKEN` and `CLAUDE_API_KEY` before every
+spawn, `bin/test-router` asserts the stripped environment explicitly, and CI
+fails if a key is present at all. This is the economic premise of the whole
+thing, so it is tested rather than commented.
+
+### Local is the availability tier, not the speed tier
+
+Measured 2026-11-03: `claude -p --model haiku` answered correctly in **3.6s**; a
+local 1.5b took **13.8s** and got it wrong. Routing to local for speed makes
+everything worse. Routing to local when the alternative is *nothing* is the point.
+That gap closes as local models improve — nothing in the structure depends on it.
+
+`--offline` forces local-only. It is a **switch, not an inference**: guessing that
+you are offline is how a tool refuses to use a working connection.
+
+### Preflight
+
+Every tier is checked at startup and reported — a tier naming a model that is not
+pulled is a config bug, and it should surface then rather than as a mysterious
+demotion on the first real request. stdout is unbuffered so those warnings survive
+being redirected to a log, which they did not at first.
+
 ## Room: Preloading
 
 Decisions are deterministic for a given (state, question), so `bin/jev` caches

@@ -1,0 +1,508 @@
+#!/usr/bin/env python3
+"""
+llm-router — one OpenAI-compatible endpoint that decides which model answers.
+
+WHY. Point everything at one URL — Continue.dev, Aider, llm-agent, a cron job,
+anything that speaks OpenAI — and stop choosing a model by hand. The router
+classifies the request and sends it to the cheapest tier that can do it, then
+falls DOWN the tiers when one is unavailable.
+
+THE ECONOMICS. `claude -p` bills the Claude Code SUBSCRIPTION, not per-token
+API, as long as ANTHROPIC_API_KEY is absent from its environment. The router
+strips that variable before every spawn. With it set, the same call silently
+becomes metered API spend — which is the exact thing this exists to avoid.
+
+LOCAL IS THE AVAILABILITY TIER, NOT THE SPEED TIER. Measured 2026-11-03:
+claude -p --model haiku answered correctly in 3.6s; a local 1.5b took 13.8s and
+got it wrong. Routing to local for speed makes everything worse. Routing to
+local when the alternative is *nothing* is the entire point. That gap will
+close as local models improve — the structure here does not depend on it.
+
+DEMOTE ON FACT, NOT ON GUESS. Nothing in Claude Code exposes remaining quota,
+so exhaustion is detected by a call failing, never predicted. One slow request
+is the honest price of having no signal to read.
+
+SAY WHICH TIER ANSWERED. Always, in a header and the log. A degraded answer
+that looks identical to a good one is the failure this whole repo keeps fighting.
+
+  llm router start            serve on :8099
+  llm router status           tiers, health, what has been demoted
+  llm router log              recent routing decisions
+  llm-router --offline        local only — the "on a plane" switch
+
+Python 3.9 compatible. Standard library only.
+"""
+
+import argparse
+import json
+import os
+import pathlib
+import re
+import subprocess
+import sys
+import threading
+import time
+import urllib.error
+import urllib.request
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+ROOT = pathlib.Path(__file__).resolve().parent.parent
+TIERS_FILE = ROOT / "router-tiers.json"
+LOG = pathlib.Path("/tmp/llm-router.log")
+STATE = pathlib.Path("/tmp/llm-router-state.json")
+OLLAMA = "http://127.0.0.1:11434"
+
+
+# ── config ─────────────────────────────────────────────────────────────────
+
+def load_tiers():
+    if not TIERS_FILE.exists():
+        sys.exit("router-tiers.json not found at {}".format(TIERS_FILE))
+    return json.loads(TIERS_FILE.read_text())
+
+
+def local_large_model(cfg):
+    """Ask llm-recommend what this machine can hold, rather than hardcoding."""
+    try:
+        out = subprocess.run([str(ROOT / "bin" / "llm-recommend"), "--quiet"],
+                             capture_output=True, text=True, timeout=30)
+        tag = out.stdout.strip()
+        if tag:
+            return tag
+    except Exception:
+        pass
+    return "qwen3-coder:30b"
+
+
+# ── optional: jev for classification ───────────────────────────────────────
+# Classification decides whether to route UP to a capable tier. It is a
+# judgement call, so a model is the right tool. Availability is NOT — that is a
+# fact about the world and must never depend on a network call.
+
+def _load_jev():
+    try:
+        import importlib.machinery as m, importlib.util as u
+        spec = u.spec_from_loader("jev", m.SourceFileLoader(
+            "jev", str(ROOT / "bin" / "jev")))
+        mod = u.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+        return mod
+    except Exception:
+        return None
+
+
+JEV = _load_jev()
+
+
+def classify(messages):
+    """Return 'small' or 'large'. Defaults large — a wrong-small wastes a whole
+    run, a wrong-large only costs a little quota."""
+    text = ""
+    for m in reversed(messages):
+        if m.get("role") == "user":
+            c = m.get("content")
+            text = c if isinstance(c, str) else json.dumps(c)
+            break
+    if not text:
+        return "large", "no-user-message"
+    if JEV is None:
+        return "large", "no-jev"
+    verdict, _conf, used = JEV.judge_model_size(text[:2000])
+    return (verdict or "large"), used
+
+
+# ── state: what has been demoted, and when ─────────────────────────────────
+
+_lock = threading.Lock()
+
+
+def read_state():
+    try:
+        return json.loads(STATE.read_text())
+    except Exception:
+        return {"demoted": {}}
+
+
+def write_state(s):
+    try:
+        STATE.write_text(json.dumps(s))
+    except Exception:
+        pass
+
+
+def mark_demoted(tier, reason, minutes=30):
+    """A failed tier is skipped for a while, then retried. Permanent demotion
+    would mean one quota blip costs the subscription path for the whole day."""
+    with _lock:
+        s = read_state()
+        s.setdefault("demoted", {})[tier] = {
+            "until": time.time() + minutes * 60, "reason": reason}
+        write_state(s)
+
+
+def is_demoted(tier):
+    s = read_state()
+    d = (s.get("demoted") or {}).get(tier)
+    if not d:
+        return False
+    if time.time() > d.get("until", 0):
+        with _lock:
+            s = read_state()
+            (s.get("demoted") or {}).pop(tier, None)
+            write_state(s)
+        return False
+    return True
+
+
+def log(entry):
+    entry["t"] = time.strftime("%H:%M:%S")
+    try:
+        with LOG.open("a") as f:
+            f.write(json.dumps(entry) + "\n")
+    except Exception:
+        pass
+
+
+# ── backends ───────────────────────────────────────────────────────────────
+
+class Unavailable(Exception):
+    """This tier cannot answer right now. Demote and try the next one."""
+
+
+def call_ollama(model, messages, max_tokens, tools=None, timeout=300):
+    body = {"model": model, "messages": messages, "max_tokens": max_tokens}
+    if tools:
+        body["tools"] = tools
+    req = urllib.request.Request(
+        OLLAMA + "/v1/chat/completions",
+        data=json.dumps(body).encode(),
+        headers={"Content-Type": "application/json"})
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as r:
+            return json.load(r)
+    except urllib.error.HTTPError as e:
+        raise Unavailable("ollama http {}: {}".format(
+            e.code, e.read().decode(errors="ignore")[:160]))
+    except Exception as e:
+        raise Unavailable("ollama {}: {}".format(type(e).__name__, e))
+
+
+def call_claude(model, messages, cfg, timeout=120):
+    """Spawn `claude -p`. Subscription-billed, provided no API key is present."""
+    prompt = flatten(messages)
+
+    # THE ECONOMIC GUARD. Strip every variable that would switch Claude Code
+    # from subscription billing to metered API billing. This is the single most
+    # important line in the file: with the key present the call still succeeds,
+    # so the mistake is invisible until the invoice.
+    env = {k: v for k, v in os.environ.items()
+           if k not in ("ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN",
+                        "CLAUDE_API_KEY")}
+
+    try:
+        p = subprocess.run(
+            ["claude", "-p", prompt, "--model", model],
+            capture_output=True, text=True, timeout=timeout, env=env)
+    except FileNotFoundError:
+        raise Unavailable("claude cli not installed")
+    except subprocess.TimeoutExpired:
+        raise Unavailable("claude timed out after {}s".format(timeout))
+    except Exception as e:
+        raise Unavailable("claude {}: {}".format(type(e).__name__, e))
+
+    combined = ((p.stdout or "") + (p.stderr or "")).lower()
+    markers = cfg.get("demotion", {}).get("quota_markers", [])
+    if p.returncode != 0 or any(mk in combined for mk in markers):
+        hit = next((mk for mk in markers if mk in combined), None)
+        raise Unavailable("claude {}".format(
+            "quota: " + hit if hit else "exit {}".format(p.returncode)))
+
+    text = (p.stdout or "").strip()
+    if not text:
+        raise Unavailable("claude returned nothing")
+    return openai_shape(text, "claude-" + model)
+
+
+def flatten(messages):
+    """claude -p takes one prompt, so the conversation is rendered into text.
+    System content is kept — unlike the ollama path, there is no template here
+    to displace, so it is safe."""
+    parts = []
+    for m in messages:
+        role = m.get("role", "user")
+        c = m.get("content")
+        if not isinstance(c, str):
+            c = json.dumps(c)
+        parts.append(c if role == "user" and len(messages) == 1
+                     else "{}: {}".format(role.upper(), c))
+    return "\n\n".join(parts)
+
+
+def openai_shape(text, model):
+    return {
+        "id": "router-{}".format(int(time.time() * 1000)),
+        "object": "chat.completion",
+        "created": int(time.time()),
+        "model": model,
+        "choices": [{"index": 0, "finish_reason": "stop",
+                     "message": {"role": "assistant", "content": text}}],
+        "usage": {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0},
+    }
+
+
+# ── routing ────────────────────────────────────────────────────────────────
+
+def route(cfg, messages, max_tokens, tools, offline, forced=None):
+    """Pick a tier, then walk DOWN on failure. Returns (response, tier, trail)."""
+    size, how = classify(messages) if not forced else (forced, "forced")
+
+    order = []
+    for t in cfg["tiers"]:
+        if offline and t["backend"] == "claude-cli":
+            continue                      # the plane switch
+        if tools and t["backend"] == "claude-cli":
+            continue                      # claude -p has no tool-call protocol
+        order.append(t)
+
+    # Start at the tier the classifier asked for; everything after it in the
+    # file is a fallback. Tiers before it are cheaper but judged insufficient.
+    start = 0
+    for i, t in enumerate(order):
+        if t.get("use_when") == size:
+            start = i
+            break
+
+    trail = []
+    for t in order[start:]:
+        if is_demoted(t["name"]):
+            trail.append("{}(demoted)".format(t["name"]))
+            continue
+        model = t.get("model") or local_large_model(cfg)
+        t0 = time.time()
+        try:
+            if t["backend"] == "ollama":
+                resp = call_ollama(model, messages, max_tokens, tools)
+            else:
+                resp = call_claude(model, messages, cfg)
+            ms = int((time.time() - t0) * 1000)
+            log({"tier": t["name"], "model": model, "size": size,
+                 "classified_by": how, "ms": ms, "trail": trail})
+            return resp, t["name"], trail
+        except Unavailable as e:
+            trail.append("{}({})".format(t["name"], e))
+            mark_demoted(t["name"], str(e))
+            log({"tier": t["name"], "demoted": str(e)})
+
+    raise Unavailable("every tier failed: " + " → ".join(trail))
+
+
+# ── server ─────────────────────────────────────────────────────────────────
+
+class Handler(BaseHTTPRequestHandler):
+    cfg = None
+    offline = False
+
+    def log_message(self, *a):
+        pass                                   # our own log is the useful one
+
+    def _send(self, code, payload, tier=None):
+        body = json.dumps(payload).encode()
+        self.send_response(code)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(body)))
+        if tier:
+            # Never let a degraded answer look identical to a good one.
+            self.send_header("X-LLM-Router-Tier", tier)
+        self.end_headers()
+        self.wfile.write(body)
+
+    def do_GET(self):
+        if self.path.rstrip("/") in ("/v1/models", "/models"):
+            models = [{"id": t["name"], "object": "model", "owned_by": "llm-router"}
+                      for t in self.cfg["tiers"]]
+            return self._send(200, {"object": "list", "data": models})
+        if self.path.rstrip("/") == "/health":
+            return self._send(200, {"status": "ok", "offline": self.offline})
+        self._send(404, {"error": {"message": "not found"}})
+
+    def do_POST(self):
+        if self.path.rstrip("/") not in ("/v1/chat/completions", "/chat/completions"):
+            return self._send(404, {"error": {"message": "not found"}})
+        try:
+            n = int(self.headers.get("Content-Length") or 0)
+            body = json.loads(self.rfile.read(n) or b"{}")
+        except Exception as e:
+            return self._send(400, {"error": {"message": "bad json: {}".format(e)}})
+
+        messages = body.get("messages") or []
+        if not messages:
+            return self._send(400, {"error": {"message": "messages required"}})
+
+        # An explicit model name is an instruction, not a hint: honour it.
+        forced = None
+        asked = (body.get("model") or "").strip()
+        for t in self.cfg["tiers"]:
+            if asked == t["name"]:
+                forced = t.get("use_when")
+
+        try:
+            resp, tier, trail = route(
+                self.cfg, messages, body.get("max_tokens", 2048),
+                body.get("tools"), self.offline, forced)
+        except Unavailable as e:
+            return self._send(503, {"error": {"message": str(e), "type": "no_tier"}})
+
+        resp["_router"] = {"tier": tier, "fell_through": trail}
+        self._send(200, resp, tier=tier)
+
+
+def installed_models():
+    """What ollama actually has. A tier naming an absent model is a config bug
+    that should surface at startup, not as a mysterious demotion on the first
+    real request."""
+    try:
+        with urllib.request.urlopen(OLLAMA + "/v1/models", timeout=5) as r:
+            return {m["id"] for m in json.load(r).get("data", [])}
+    except Exception:
+        return None
+
+
+def preflight(cfg, offline):
+    """Check every tier can actually answer, and say so plainly."""
+    have = installed_models()
+    problems = []
+    for t in cfg["tiers"]:
+        name, backend = t["name"], t["backend"]
+        if backend == "ollama":
+            model = t.get("model") or local_large_model(cfg)
+            if have is None:
+                print("  {:<12} ?  ollama not reachable".format(name))
+                problems.append(name)
+            elif model in have:
+                print("  {:<12} ok  {}".format(name, model))
+            else:
+                print("  {:<12} \033[33mMISSING\033[0m  {} not pulled"
+                      .format(name, model))
+                print("  {:<12}     → ollama pull {}".format("", model))
+                problems.append(name)
+        else:
+            if offline:
+                print("  {:<12} skipped (--offline)".format(name))
+            elif shutil_which("claude"):
+                print("  {:<12} ok  claude cli".format(name))
+            else:
+                print("  {:<12} \033[33mMISSING\033[0m  claude cli not on PATH"
+                      .format(name))
+                problems.append(name)
+    return problems
+
+
+def shutil_which(cmd):
+    import shutil
+    return shutil.which(cmd)
+
+
+def serve(cfg, offline):
+    # Python block-buffers stdout when it is not a tty, so every startup line
+    # — including the MISSING-tier warnings — vanished when run under a
+    # launcher or with output redirected. Reconfigure before printing anything.
+    try:
+        sys.stdout.reconfigure(line_buffering=True)
+    except Exception:
+        pass
+    Handler.cfg = cfg
+    Handler.offline = offline
+    port = cfg.get("port", 8099)
+    srv = ThreadingHTTPServer(("127.0.0.1", port), Handler)
+    print("llm-router on http://127.0.0.1:{}/v1".format(port))
+    print("  tiers:   " + " → ".join(t["name"] for t in cfg["tiers"]))
+    print("  offline: {}".format("YES (local only)" if offline else "no"))
+    print("  jev:     {}".format(
+        "available" if JEV and JEV.available() else "fallback (classifies large)"))
+    print("  log:     {}".format(LOG))
+    print("\ntier preflight:")
+    problems = preflight(cfg, offline)
+    usable = len(cfg["tiers"]) - len(problems)
+    if usable == 0:
+        sys.exit("\nNo tier can answer. Fix the above before starting.")
+    if problems:
+        print("\n  {} of {} tiers usable. Requests will fall through to a"
+              .format(usable, len(cfg["tiers"])))
+        print("  working tier — which is the design, but you are paying for a")
+        print("  demotion on every request that should have hit a missing one.")
+    print()
+    try:
+        srv.serve_forever()
+    except KeyboardInterrupt:
+        print("\nstopped")
+
+
+# ── cli ────────────────────────────────────────────────────────────────────
+
+def status(cfg):
+    print("router-tiers.json  {}".format(TIERS_FILE))
+    print("port               {}".format(cfg.get("port", 8099)))
+    try:
+        with urllib.request.urlopen(
+                "http://127.0.0.1:{}/health".format(cfg.get("port", 8099)),
+                timeout=2) as r:
+            print("server             running ({})".format(json.load(r)))
+    except Exception:
+        print("server             not running")
+    print("\ntiers:")
+    for t in cfg["tiers"]:
+        d = is_demoted(t["name"])
+        print("  {:<12} {:<11} {}{}".format(
+            t["name"], t["backend"], t.get("model") or "(from llm-recommend)",
+            "   ⚠ DEMOTED" if d else ""))
+    s = read_state()
+    for name, d in (s.get("demoted") or {}).items():
+        left = int((d["until"] - time.time()) / 60)
+        print("\n  {} demoted for {}m — {}".format(name, max(left, 0), d["reason"]))
+    print("\njev                {}".format(
+        "available" if JEV and JEV.available() else "no key — classifies large"))
+    if os.environ.get("ANTHROPIC_API_KEY"):
+        print("\n  \033[31m⚠ ANTHROPIC_API_KEY IS SET\033[0m — the router strips it per call,")
+        print("    but anything else you run will bill per-token instead of the")
+        print("    subscription. That is the opposite of the point.")
+
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("command", nargs="?", default="start",
+                    choices=["start", "status", "log"])
+    ap.add_argument("--offline", action="store_true",
+                    help="local tiers only — the 'on a plane' switch")
+    ap.add_argument("--port", type=int)
+    a = ap.parse_args()
+
+    cfg = load_tiers()
+    if a.port:
+        cfg["port"] = a.port
+
+    if a.command == "status":
+        return status(cfg)
+    if a.command == "log":
+        if not LOG.exists():
+            print("no decisions logged yet")
+            return 0
+        for line in LOG.read_text().splitlines()[-25:]:
+            try:
+                d = json.loads(line)
+            except Exception:
+                continue
+            if "demoted" in d:
+                print("  {}  {:<12} DEMOTED  {}".format(
+                    d.get("t"), d.get("tier"), d["demoted"]))
+            else:
+                print("  {}  {:<12} {:>6}ms  {} [{}]".format(
+                    d.get("t"), d.get("tier"), d.get("ms"),
+                    d.get("model"), d.get("classified_by")))
+        return 0
+
+    serve(cfg, a.offline)
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

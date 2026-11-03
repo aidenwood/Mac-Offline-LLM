@@ -99,6 +99,16 @@ jobs:
           bin/jev status
           bin/jev --selftest
 
+      - name: Router tiering, demotion and the billing guard
+        run: |
+          set -e
+          bin/test-router
+          # The economic premise, asserted in CI too: a key must never be
+          # present, or every claude call silently becomes metered API spend.
+          if [ -n "${ANTHROPIC_API_KEY:-}" ]; then
+            echo "FAIL: ANTHROPIC_API_KEY set on CI"; exit 1
+          fi
+
       - name: --whip must WARN, never silently no-op
         run: |
           set -e

@@ -11,7 +11,7 @@ Stop hook when one is installed.
 | [halls/models.md](halls/models.md) | choosing a model, quantisation, what fits in RAM |
 | [halls/serving.md](halls/serving.md) | running `llm`, ports, flags, llama.cpp behaviour |
 | [halls/agentic.md](halls/agentic.md) | `llm-agent`, tool calling, Whip-It-Good integration |
-| [halls/decisions.md](halls/decisions.md) | typed decisions via Jev, and where NOT to use a model |
+| [halls/decisions.md](halls/decisions.md) | the router's tiers, typed decisions via Jev, and where NOT to use a model |
 
 ## Hard rules for this project
 

@@ -1,0 +1,228 @@
+#!/usr/bin/env python3
+"""
+test-router — tier selection, demotion, and the billing guard.
+
+No network and no model required: the backends are stubbed so the ROUTING
+logic is what gets tested, not whether a model happens to be pulled today.
+
+The most important case in here is the last one. `claude -p` bills the Claude
+Code subscription only while ANTHROPIC_API_KEY is absent from its environment.
+With the key set the call still succeeds — so the mistake is invisible until
+the invoice arrives. That is precisely the kind of failure this repo keeps
+finding, so it gets an explicit assertion rather than a comment.
+
+Python 3.9 compatible.
+"""
+
+import importlib.machinery
+import importlib.util
+import json
+import os
+import pathlib
+import sys
+import tempfile
+
+HERE = pathlib.Path(__file__).resolve().parent
+spec = importlib.util.spec_from_loader(
+    "llm_router", importlib.machinery.SourceFileLoader(
+        "llm_router", str(HERE / "llm-router")))
+R = importlib.util.module_from_spec(spec)
+sys.argv = ["llm-router", "status"]
+spec.loader.exec_module(R)
+
+PASS, FAIL = "\033[32mPASS\033[0m", "\033[31mFAIL\033[0m"
+results = []
+
+# Isolate: never touch the real demotion state or log.
+tmp = pathlib.Path(tempfile.mkdtemp(prefix="router-test-"))
+R.STATE = tmp / "state.json"
+R.LOG = tmp / "router.log"
+
+CFG = json.loads((HERE.parent / "router-tiers.json").read_text())
+
+
+def check(name, ok, detail=""):
+    results.append(bool(ok))
+    print("  {}  {}".format(PASS if ok else FAIL, name))
+    if detail:
+        print("        {}".format(detail))
+
+
+MSG_SMALL = [{"role": "user", "content": "rename foo to bar"}]
+MSG_LARGE = [{"role": "user", "content": "design a caching layer"}]
+
+
+def stub(ok_tiers):
+    """Replace the real backends. Any tier not in ok_tiers raises Unavailable."""
+    calls = []
+
+    def ollama(model, messages, max_tokens, tools=None, timeout=300):
+        calls.append(("ollama", model))
+        if "ollama" not in ok_tiers:
+            raise R.Unavailable("stub: ollama down")
+        return R.openai_shape("ollama said so", model)
+
+    def claude(model, messages, cfg, timeout=120):
+        calls.append(("claude", model))
+        if "claude" not in ok_tiers:
+            raise R.Unavailable("stub: usage limit reached")
+        return R.openai_shape("claude said so", "claude-" + model)
+
+    R.call_ollama, R.call_claude = ollama, claude
+    return calls
+
+
+def clear_state():
+    try:
+        R.STATE.unlink()
+    except Exception:
+        pass
+
+
+# ── classification drives the starting tier ────────────────────────────────
+print("tier selection:")
+
+R.classify = lambda m: ("small", "stub")
+clear_state(); stub({"ollama", "claude"})
+_, tier, _ = R.route(CFG, MSG_SMALL, 100, None, False)
+check("classifier says small → local-small", tier == "local-small", tier)
+
+R.classify = lambda m: ("large", "stub")
+clear_state(); stub({"ollama", "claude"})
+_, tier, _ = R.route(CFG, MSG_LARGE, 100, None, False)
+check("classifier says large → claude", tier == "claude", tier)
+
+
+# ── demotion walks DOWN, and only on real failure ──────────────────────────
+print("\ndemotion:")
+
+R.classify = lambda m: ("large", "stub")
+clear_state(); stub({"ollama"})          # claude unavailable
+_, tier, trail = R.route(CFG, MSG_LARGE, 100, None, False)
+check("claude quota error → falls to local-large",
+      tier == "local-large", "{}  trail={}".format(tier, trail))
+check("the fall-through is reported, not hidden", len(trail) > 0, str(trail))
+
+clear_state(); stub({"claude"})          # ollama down, claude up
+R.classify = lambda m: ("small", "stub")
+_, tier, trail = R.route(CFG, MSG_SMALL, 100, None, False)
+check("local down → promotes to claude rather than failing",
+      tier == "claude", "{}  trail={}".format(tier, trail))
+
+clear_state(); stub(set())               # nothing works
+try:
+    R.route(CFG, MSG_LARGE, 100, None, False)
+    check("every tier down → raises, never returns a fake answer", False)
+except R.Unavailable as e:
+    check("every tier down → raises, never returns a fake answer", True, str(e)[:60])
+
+# A demoted tier is skipped, but not forever — one blip must not cost the
+# subscription path for the rest of the day.
+clear_state()
+R.mark_demoted("claude", "test", minutes=30)
+check("a demoted tier is skipped", R.is_demoted("claude"))
+R.mark_demoted("claude", "test", minutes=-1)
+check("…and expires, so it is retried later", not R.is_demoted("claude"))
+
+
+# ── offline is a switch, never an inference ────────────────────────────────
+print("\noffline:")
+
+clear_state(); stub({"ollama", "claude"})
+R.classify = lambda m: ("large", "stub")
+_, tier, _ = R.route(CFG, MSG_LARGE, 100, None, True)     # offline=True
+check("--offline never reaches claude, even for a large task",
+      tier != "claude", tier)
+
+clear_state()
+calls = stub({"ollama", "claude"})
+R.route(CFG, MSG_LARGE, 100, None, True)
+check("…and claude is not even called", all(c[0] != "claude" for c in calls),
+      str(calls))
+
+
+# ── tool calls must not go to a backend that cannot do them ────────────────
+print("\ntools:")
+
+clear_state()
+calls = stub({"ollama", "claude"})
+R.classify = lambda m: ("large", "stub")
+TOOLS = [{"type": "function", "function": {"name": "x", "parameters": {}}}]
+_, tier, _ = R.route(CFG, MSG_LARGE, 100, TOOLS, False)
+check("a tools request skips claude (no tool-call protocol over -p)",
+      tier != "claude" and all(c[0] != "claude" for c in calls), tier)
+
+
+# ── THE BILLING GUARD ──────────────────────────────────────────────────────
+print("\nbilling guard (the economic premise):")
+
+import subprocess as _sp
+captured = {}
+real_run = _sp.run
+
+
+def fake_run(cmd, **kw):
+    captured["env"] = kw.get("env") or {}
+    captured["cmd"] = cmd
+
+    class P:
+        returncode = 0
+        stdout = "ok"
+        stderr = ""
+    return P()
+
+
+_sp.run = fake_run
+# restore the real call_claude so the env-stripping code actually runs
+importlib.reload  # noqa - marker that we deliberately re-exec below
+spec2 = importlib.util.spec_from_loader(
+    "llm_router2", importlib.machinery.SourceFileLoader(
+        "llm_router2", str(HERE / "llm-router")))
+R2 = importlib.util.module_from_spec(spec2)
+sys.argv = ["llm-router", "status"]
+spec2.loader.exec_module(R2)
+R2.subprocess = _sp
+
+os.environ["ANTHROPIC_API_KEY"] = "sk-ant-THIS-MUST-NOT-REACH-THE-SUBPROCESS"
+os.environ["ANTHROPIC_AUTH_TOKEN"] = "also-must-not"
+try:
+    R2.call_claude("haiku", MSG_LARGE, CFG)
+finally:
+    os.environ.pop("ANTHROPIC_API_KEY", None)
+    os.environ.pop("ANTHROPIC_AUTH_TOKEN", None)
+    _sp.run = real_run
+
+env = captured.get("env", {})
+check("ANTHROPIC_API_KEY is stripped from the claude subprocess",
+      "ANTHROPIC_API_KEY" not in env,
+      "present!" if "ANTHROPIC_API_KEY" in env else "absent — subscription billing")
+check("ANTHROPIC_AUTH_TOKEN is stripped too",
+      "ANTHROPIC_AUTH_TOKEN" not in env)
+check("…but the rest of the environment survives (PATH etc.)",
+      "PATH" in env, "{} vars passed".format(len(env)))
+
+
+# ── quota markers are what trigger a demotion ──────────────────────────────
+print("\nquota detection:")
+
+for marker in CFG["demotion"]["quota_markers"][:3]:
+    def run_with_marker(cmd, _m=marker, **kw):
+        class P:
+            returncode = 1
+            stdout = ""
+            stderr = "Error: {} reached".format(_m)
+        return P()
+    _sp.run = run_with_marker
+    R2.subprocess = _sp
+    try:
+        R2.call_claude("haiku", MSG_LARGE, CFG)
+        check("'{}' triggers demotion".format(marker), False, "no exception")
+    except R2.Unavailable as e:
+        check("'{}' triggers demotion".format(marker), marker in str(e), str(e)[:50])
+_sp.run = real_run
+
+import shutil
+shutil.rmtree(tmp, ignore_errors=True)
+
+print("\n{}/{} passed".format(sum(results), len(results)))
+sys.exit(0 if all(results) else 1)

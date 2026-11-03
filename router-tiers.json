@@ -1,0 +1,50 @@
+{
+  "_comment": "Routing table for bin/llm-router. Data, not code, so a tier can be added or re-ordered without touching the server. Order matters: demotion walks DOWN this list, and the last tier must always be one that works with no network and no subscription — it is the floor.",
+  "generated": "2026-11-03",
+
+  "port": 8099,
+
+  "tiers": [
+    {
+      "name": "local-small",
+      "backend": "ollama",
+      "model": "qwen2.5-coder:1.5b",
+      "use_when": "small",
+      "costs": "nothing",
+      "note": "Mechanical work only: a rename, a one-line fix, a reformat. Chosen by jev's judge_model_size, never by guess.",
+      "_warning": "The :1.5b-base tag on this machine is NOT instruction-tuned and rambles. The instruct tag is the one to pull."
+    },
+    {
+      "name": "claude",
+      "backend": "claude-cli",
+      "model": "haiku",
+      "use_when": "large",
+      "costs": "Claude Code subscription quota, NOT per-token API",
+      "note": "Measured 3.6s round trip and correct, which is ~4x faster than the local 1.5b AND right. This is the primary path for anything needing judgement.",
+      "_critical": "ANTHROPIC_API_KEY must never be present in this subprocess's environment. With it set, every call becomes metered API spend instead of subscription quota — silently. The router strips it."
+    },
+    {
+      "name": "local-large",
+      "backend": "ollama",
+      "model": null,
+      "use_when": "fallback",
+      "costs": "nothing",
+      "note": "The floor. model:null means ask llm-recommend what this machine can actually hold, rather than hardcoding a tag that may not fit a different Mac.",
+      "_why_last": "Works with no network, no subscription and no key. Every demotion path ends here, so it must never itself depend on anything remote."
+    }
+  ],
+
+  "demotion": {
+    "_comment": "What counts as 'this tier is unavailable'. Detected by FAILURE, never predicted — nothing in Claude Code exposes remaining quota, so guessing would mean demoting while the good path still worked.",
+    "quota_markers": [
+      "usage limit",
+      "rate limit",
+      "quota",
+      "exceeded your",
+      "too many requests",
+      "insufficient credit"
+    ],
+    "timeout_seconds": 120,
+    "note": "A quota failure costs one slow request before the demotion. That is the honest price of having no quota signal to read."
+  }
+}

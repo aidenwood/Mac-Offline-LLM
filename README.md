@@ -139,6 +139,36 @@ rather than a silent no-op.
 
 ---
 
+## One endpoint, three tiers
+
+```bash
+llm router start                 # :8099, OpenAI-compatible
+llm router status                # tiers, health, what is demoted
+llm router log                   # what went where, and why
+llm-router --offline             # local only — the "on a plane" switch
+```
+
+Point anything that speaks OpenAI at `http://localhost:8099/v1` and stop choosing
+a model by hand:
+
+```
+  local-small  →  claude  →  local-large
+  (free)          (subscription)  (free, the floor)
+```
+
+A trivial edit goes to a 1.5b. Something needing judgement goes to `claude -p`,
+which bills the **Claude Code subscription, not per-token API**. When that tier
+fails — quota, network, timeout — it falls to the local 30B and **says so**, in a
+response header and the log. The last tier works with no network, no subscription
+and no key, so every path has a floor.
+
+**Local is the availability tier, not the speed tier.** Measured: `claude -p`
+answered correctly in 3.6s where a local 1.5b took 13.8s and got it wrong.
+Routing to local for speed makes things worse; routing to local when the
+alternative is nothing is the entire point.
+
+Detail: [halls/decisions.md](halls/decisions.md).
+
 ## Faster decisions, not another chat model
 
 Several things here were decided by a regex standing in for judgement. A regex
@@ -230,6 +260,7 @@ removes exactly the PATH wiring it added and leaves your models alone.
 bin/test-whip        13 cases: whip, verify gate, context trimming
 bin/test-recommend   30 cases: budget formula, tier selection, honesty
 bin/jev --selftest    6 cases: every decision falls back with no key
+bin/test-router      17 cases: tiering, demotion, offline, billing guard
 ```
 
 `test-recommend` exercises RAM tiers this machine is not — 8 GB through 128 GB —
