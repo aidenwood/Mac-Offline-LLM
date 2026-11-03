@@ -5,6 +5,7 @@
 #   llm link                     one model store: point LM Studio + ollama here
 #   llm jev status|--selftest    typed decisions (optional; falls back offline)
 #   llm router start|status|log  ONE OpenAI endpoint that picks the tier for you
+#   llm service install          keep the router up: at login, and after a crash
 #   llm up [tag]                 daemon up, model resident, ready to work
 #   llm agent "task"             up, then run the whipped agentic loop against it
 #   llm chat                     up, then a long-running session: full shell, writes anywhere
@@ -125,6 +126,7 @@ case "$cmd" in
   recommend) exec "$ROOT/bin/llm-recommend" "$@" ;;
   jev)     exec "$ROOT/bin/jev" "$@" ;;
   router)  exec "$ROOT/bin/llm-router" "$@" ;;
+  service) exec "$ROOT/bin/llm-service" "$@" ;;
   probe)   exec "$ROOT/bin/llm-probe-tools" "$@" ;;
 
   up)     bring_up "${1:-$AGENT_MODEL}" ;;

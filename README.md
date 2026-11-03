@@ -142,7 +142,8 @@ rather than a silent no-op.
 ## One endpoint, three tiers
 
 ```bash
-llm router start                 # :8099, OpenAI-compatible
+llm service install              # run it always: at login, and after a crash
+llm router start                 # or just run it in the foreground
 llm router status                # tiers, health, what is demoted
 llm router log                   # what went where, and why
 llm-router --offline             # local only — the "on a plane" switch
@@ -166,6 +167,18 @@ and no key, so every path has a floor.
 answered correctly in 3.6s where a local 1.5b took 13.8s and got it wrong.
 Routing to local for speed makes things worse; routing to local when the
 alternative is nothing is the entire point.
+
+**Install it as a service and forget it.** `llm service install` registers a
+LaunchAgent that starts the router at login and restarts it if it dies, and the
+router starts `ollama` itself if that is down — so the local tiers, which are the
+floor, never fail for a reason the tool could have fixed.
+
+One macOS wrinkle worth knowing: **TCC blocks launchd from reading `~/Desktop`,
+`~/Documents` and `~/Downloads`** without Full Disk Access, and a wrapper script
+does not escape it. The installer therefore deploys a copy to
+`~/.local/share/llm-router/` and runs from there. It is a build artifact, not a
+fork — `install` re-copies every time and `status` hashes both sides, so drift is
+reported rather than allowed.
 
 Detail: [halls/decisions.md](halls/decisions.md).
 

@@ -1,0 +1,181 @@
+#!/usr/bin/env bash
+# llm-service — keep the router running without being asked.
+#
+# WHY. The router is only useful if it is already there. Having to remember to
+# start it is the same class of problem as a guard that silently disables
+# itself: the tool appears to exist and then is not available at the moment you
+# reach for it. "Any position, any time" means the thing is up before you think
+# about it.
+#
+#   llm service install      start now, and at every login, and if it crashes
+#   llm service uninstall    stop and remove — leaves models and config alone
+#   llm service status       is it up, since when, what is the log saying
+#   llm service restart      after changing router-tiers.json
+#   llm service log          tail the router log
+#
+# Uses launchd (a LaunchAgent, user-level — no sudo, no root, nothing system
+# wide). KeepAlive restarts it if it dies; RunAtLoad starts it at login.
+#
+# NOT a daemon that phones home. It binds 127.0.0.1 only and makes no outbound
+# call that the router itself would not have made.
+set -uo pipefail
+
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+LABEL="com.aidxn.llm-router"
+
+# macOS TCC blocks launchd-spawned processes from reading ~/Desktop,
+# ~/Documents and ~/Downloads without Full Disk Access. The error is
+# "Operation not permitted" on a file you can plainly read yourself, and a
+# wrapper shim does NOT escape it — TCC follows the process, not the path.
+#
+# So the service runs from a DEPLOYED COPY outside the protected tree. This is
+# a build artifact, not a fork: `install` re-copies every time, and `status`
+# hashes both sides so drift is reported rather than silently diverging. Never
+# edit the deploy — edit the repo and re-install.
+DEPLOY="$HOME/.local/share/llm-router"
+PLIST="$HOME/Library/LaunchAgents/$LABEL.plist"
+OUT="$HOME/Library/Logs/llm-router.log"
+ERR="$HOME/Library/Logs/llm-router.err.log"
+
+ok()   { printf "  \033[32m✓\033[0m %s\n" "$*"; }
+warn() { printf "  \033[33m⚠\033[0m %s\n" "$*"; }
+bad()  { printf "  \033[31m✗\033[0m %s\n" "$*"; }
+
+port() { python3 -c "import json;print(json.load(open('$ROOT/router-tiers.json')).get('port',8099))" 2>/dev/null || echo 8099; }
+
+deploy() {
+  mkdir -p "$DEPLOY"
+  rm -rf "$DEPLOY/bin"
+  mkdir -p "$DEPLOY/bin"
+  cp "$ROOT/bin/llm-router" "$ROOT/bin/llm-recommend" "$ROOT/bin/jev" \
+     "$ROOT/bin/gguf-arch" "$DEPLOY/bin/" 2>/dev/null
+  cp "$ROOT/router-tiers.json" "$ROOT/models.json" "$DEPLOY/" 2>/dev/null
+  chmod +x "$DEPLOY"/bin/* 2>/dev/null
+  printf '%s' "$ROOT" > "$DEPLOY/.source"
+  hash_tree "$ROOT" > "$DEPLOY/.hash"
+  ok "deployed from $ROOT"
+}
+
+hash_tree() {
+  local d="$1"
+  shasum "$d/bin/llm-router" "$d/bin/llm-recommend" "$d/bin/jev" \
+         "$d/router-tiers.json" 2>/dev/null | awk '{print $1}' | shasum | awk '{print $1}'
+}
+
+write_plist() {
+  mkdir -p "$HOME/LaunchAgents" 2>/dev/null
+  mkdir -p "$HOME/Library/LaunchAgents" "$HOME/Library/Logs"
+  cat > "$PLIST" <<EOF
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
+  "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key><string>$LABEL</string>
+
+  <!-- Absolute paths: launchd has almost no PATH, so anything relying on the
+       shell's environment will fail silently here. -->
+  <key>ProgramArguments</key>
+  <array>
+    <string>/usr/bin/python3</string>
+    <string>$DEPLOY/bin/llm-router</string>
+    <string>start</string>
+  </array>
+
+  <key>RunAtLoad</key><true/>
+  <key>KeepAlive</key><true/>
+
+  <!-- Crash-looping on a config error should not burn the CPU. -->
+  <key>ThrottleInterval</key><integer>10</integer>
+
+  <key>StandardOutPath</key><string>$OUT</string>
+  <key>StandardErrorPath</key><string>$ERR</string>
+  <key>WorkingDirectory</key><string>$DEPLOY</string>
+
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>PATH</key>
+    <string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
+    <!-- Deliberately NOT setting ANTHROPIC_API_KEY. Its presence would flip
+         every claude call from subscription billing to metered API spend,
+         silently. The router strips it per-call too; this is the second lock. -->
+  </dict>
+</dict>
+</plist>
+EOF
+}
+
+case "${1:-status}" in
+  install)
+    deploy
+    write_plist
+    launchctl unload "$PLIST" 2>/dev/null
+    launchctl load "$PLIST" 2>/dev/null && ok "loaded $LABEL" || { bad "launchctl load failed"; exit 1; }
+    for _ in $(seq 1 30); do
+      curl -sf -o /dev/null "http://127.0.0.1:$(port)/health" 2>/dev/null && break
+      sleep 1
+    done
+    if curl -sf -o /dev/null "http://127.0.0.1:$(port)/health" 2>/dev/null; then
+      ok "router answering on :$(port)"
+      ok "starts at login, restarts if it dies"
+      echo
+      echo "  Point anything at  http://127.0.0.1:$(port)/v1"
+      echo "  Logs:              $OUT"
+    else
+      bad "loaded but not answering — check $ERR"
+      tail -5 "$ERR" 2>/dev/null | sed 's/^/      /'
+      exit 1
+    fi ;;
+
+  uninstall)
+    launchctl unload "$PLIST" 2>/dev/null && ok "unloaded" || warn "was not loaded"
+    rm -f "$PLIST" && ok "removed $PLIST"
+    rm -rf "$DEPLOY" && ok "removed the deployed copy"
+    echo
+    echo "  Models, config and the Jev key were left alone."
+    echo "  (ollama is managed separately — brew services, or by hand.)" ;;
+
+  restart)
+    deploy
+    launchctl unload "$PLIST" 2>/dev/null
+    launchctl load "$PLIST" 2>/dev/null && ok "restarted" || bad "no service installed — run: llm service install" ;;
+
+  log)
+    [ -f "$OUT" ] && tail -40 "$OUT" || echo "  no log yet at $OUT" ;;
+
+  status)
+    if [ -f "$PLIST" ]; then ok "installed  $PLIST"; else warn "not installed — run: llm service install"; fi
+    if [ -d "$DEPLOY" ]; then
+      if [ "$(hash_tree "$ROOT")" = "$(cat "$DEPLOY/.hash" 2>/dev/null)" ]; then
+        ok "deploy matches the repo"
+      else
+        warn "deploy is STALE — repo has changed. Run: llm service restart"
+      fi
+    fi
+    # Capture first, THEN grep. `launchctl list | grep -q` is a trap under
+    # `set -o pipefail`: grep -q exits on the first match, SIGPIPEs launchctl,
+    # and pipefail reports the pipeline as failed — so a running service was
+    # reported "not loaded". A status that lies is worse than no status.
+    listing="$(launchctl list 2>/dev/null || true)"
+    line="$(printf '%s\n' "$listing" | grep "$LABEL" || true)"
+    if [ -n "$line" ]; then
+      pid="$(printf '%s' "$line" | awk '{print $1}')"
+      [ "$pid" != "-" ] && ok "running  pid $pid" || warn "loaded but not running (last exit $(echo "$line" | awk '{print $2}'))"
+    else
+      warn "not loaded in launchd"
+    fi
+    if curl -sf -o /dev/null --max-time 3 "http://127.0.0.1:$(port)/health" 2>/dev/null; then
+      ok "answering on :$(port)"
+    else
+      bad "NOT answering on :$(port)"
+    fi
+    if curl -sf -o /dev/null --max-time 3 http://127.0.0.1:11434/api/tags 2>/dev/null; then
+      ok "ollama up (the local tiers need it)"
+    else
+      bad "ollama DOWN — every local tier will demote"
+      echo "      brew services start ollama   # or: ollama serve &"
+    fi ;;
+
+  *)
+    sed -n '2,18p' "$0" | sed 's/^# \{0,1\}//'; exit 2 ;;
+esac

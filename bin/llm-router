@@ -170,6 +170,10 @@ class Unavailable(Exception):
 
 
 def call_ollama(model, messages, max_tokens, tools=None, timeout=300):
+    # Self-heal rather than demote. Checked per call because ollama can die
+    # after startup, and the local tiers are the floor — they must try hardest.
+    if not ollama_up(timeout=2) and not ensure_ollama():
+        raise Unavailable("ollama not running and could not be started")
     body = {"model": model, "messages": messages, "max_tokens": max_tokens}
     if tools:
         body["tools"] = tools
@@ -356,6 +360,36 @@ class Handler(BaseHTTPRequestHandler):
         self._send(200, resp, tier=tier)
 
 
+def ollama_up(timeout=3):
+    try:
+        urllib.request.urlopen(OLLAMA + "/api/tags", timeout=timeout).read()
+        return True
+    except Exception:
+        return False
+
+
+def ensure_ollama(wait=25):
+    """Start ollama if it is not already serving.
+
+    Without this, ollama being down demotes EVERY local tier — so the floor,
+    the thing that is supposed to work when nothing else does, is the first
+    thing to fail. A dependency the router can start itself should not be a
+    reason to give up.
+    """
+    if ollama_up():
+        return True
+    try:
+        subprocess.Popen(["ollama", "serve"],
+                         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    except Exception:
+        return False
+    for _ in range(wait * 2):
+        if ollama_up(timeout=2):
+            return True
+        time.sleep(0.5)
+    return False
+
+
 def installed_models():
     """What ollama actually has. A tier naming an absent model is a config bug
     that should surface at startup, not as a mysterious demotion on the first
@@ -369,6 +403,12 @@ def installed_models():
 
 def preflight(cfg, offline):
     """Check every tier can actually answer, and say so plainly."""
+    if not ollama_up():
+        print("  ollama       starting…")
+        if ensure_ollama():
+            print("  ollama       ok  started by the router")
+        else:
+            print("  ollama       \033[33mDOWN\033[0m  local tiers will demote")
     have = installed_models()
     problems = []
     for t in cfg["tiers"]:
