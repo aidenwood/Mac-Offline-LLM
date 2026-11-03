@@ -93,8 +93,8 @@ jobs:
       - name: Decision fallbacks hold with no API key
         run: |
           set -e
-          if [ -n "${OPENROUTER_API_KEY:-}" ]; then
-            echo "FAIL: CI must prove the OFFLINE path"; exit 1
+          if [ -n "${JEV_API_KEY:-}" ] || [ -n "${OPENROUTER_API_KEY:-}" ]; then
+            echo "FAIL: CI must prove the OFFLINE path, not the live one"; exit 1
           fi
           bin/jev status
           bin/jev --selftest

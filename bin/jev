@@ -27,7 +27,7 @@ is no key or no connection, and `used` in the result always tells you which
 one answered. A Jev outage must never change what this tool is willing to do —
 it may only change how well it judges.
 
-  export OPENROUTER_API_KEY=...        # required for live decisions
+  export JEV_API_KEY=...               # or ~/.claude/jev/aidxn.token (chmod 600)
   jev choice  "state" --options a,b,c --instructions "..."
   jev noul    "state" --instructions "is the work complete?"
   jev score   "state" --instructions "how risky, 0-10?"
@@ -46,19 +46,49 @@ import time
 import urllib.error
 import urllib.request
 
-ENDPOINT = "https://openrouter.ai/api/alpha/decisions"
-MODEL = os.environ.get("JEV_MODEL", "typesafe/jev-1.13")
+# Native TypeSafe API. Discovered from https://api.typesafe.ai/openapi.json —
+# third-party write-ups describe the OpenRouter route instead, which takes an
+# sk-or-v1- key and rejects a native apikey_ one with 401. GET /v1/models lists
+# the real names: jev-latest and jev-preview. "typesafe/jev-1.13" is OpenRouter
+# naming and 404s here.
+ENDPOINT = os.environ.get("JEV_ENDPOINT", "https://api.typesafe.ai/v1/systemone")
+MODEL = os.environ.get("JEV_MODEL", "jev-latest")
 TIMEOUT = float(os.environ.get("JEV_TIMEOUT", "4"))
 
 # Decisions are deterministic for a given (state, question). Caching them turns
 # a repeat decision into a disk read, which matters for "preload": you can warm
 # the cache for a queue of work before any of it runs.
-CACHE = pathlib.Path(os.environ.get(
-    "JEV_CACHE", str(pathlib.Path.home() / ".cache" / "jev")))
+def cache_dir():
+    return pathlib.Path(os.environ.get(
+        "JEV_CACHE", str(pathlib.Path.home() / ".cache" / "jev")))
+
+
+# chmod 600, outside any repo, never echoed. Same shape as the other tokens
+# on this machine. $JEV_API_KEY wins so CI can run without a file.
+DEFAULT_TOKEN_FILE = pathlib.Path.home() / ".claude" / "jev" / "aidxn.token"
+
+
+def token_file():
+    """Resolved per call, not at import. Binding it as a module constant meant
+    the self-test could not disable the key — it tested the live path while
+    reporting that it was testing the fallback. A test that cannot isolate
+    itself is worse than no test."""
+    return pathlib.Path(os.environ.get("JEV_TOKEN_FILE", str(DEFAULT_TOKEN_FILE)))
+
+
+def api_key():
+    k = os.environ.get("JEV_API_KEY") or os.environ.get("OPENROUTER_API_KEY")
+    if k:
+        return k.strip()
+    try:
+        # .strip() matters: a trailing newline silently breaks a Bearer header.
+        return token_file().read_text().strip() or None
+    except Exception:
+        return None
 
 
 def available():
-    return bool(os.environ.get("OPENROUTER_API_KEY"))
+    return bool(api_key())
 
 
 def _key(payload):
@@ -67,7 +97,7 @@ def _key(payload):
 
 
 def _cached(k):
-    f = CACHE / (k + ".json")
+    f = cache_dir() / (k + ".json")
     if not f.exists():
         return None
     try:
@@ -78,8 +108,9 @@ def _cached(k):
 
 def _store(k, value):
     try:
-        CACHE.mkdir(parents=True, exist_ok=True)
-        (CACHE / (k + ".json")).write_text(json.dumps(value))
+        d = cache_dir()
+        d.mkdir(parents=True, exist_ok=True)
+        (d / (k + ".json")).write_text(json.dumps(value))
     except Exception:
         pass                                   # a cache failure is never fatal
 
@@ -101,12 +132,18 @@ def ask(state, questions, use_cache=True):
         ENDPOINT,
         data=json.dumps(payload).encode(),
         headers={
-            "Authorization": "Bearer " + os.environ["OPENROUTER_API_KEY"],
+            "Authorization": "Bearer " + api_key(),
             "Content-Type": "application/json",
         })
     try:
         with urllib.request.urlopen(req, timeout=TIMEOUT) as r:
-            answers = json.load(r).get("answers", {})
+            body = json.load(r)
+            answers = body.get("answers", {})
+            u = body.get("usage") or {}
+            if os.environ.get("JEV_VERBOSE"):
+                print("  (jev {} · {} in / {} out tokens)".format(
+                    body.get("model"), u.get("input_tokens"),
+                    u.get("output_tokens")), file=sys.stderr)
     except urllib.error.HTTPError as e:
         return None, "http-{}".format(e.code)
     except Exception as e:
@@ -163,6 +200,12 @@ def judge_command(cmd, regex_verdict):
     caught: a pattern match is evidence, and a probabilistic model should not
     be able to talk the guard out of a known-bad command.
     """
+    # Short-circuit: the regex already refuses this, and nothing Jev returns
+    # can change that. Calling anyway burned ~300ms and tokens to discard the
+    # answer — pay for a decision only where it can alter the outcome.
+    if regex_verdict == "catastrophic":
+        return "catastrophic", 1.0, "regex-override"
+
     verdict, conf, used = choice(
         cmd,
         "danger",
@@ -178,8 +221,6 @@ def judge_command(cmd, regex_verdict):
                             "wipes a disk, erases home, fork bomb, shutdown.",
         },
         fallback=regex_verdict)
-    if regex_verdict == "catastrophic":
-        return "catastrophic", 1.0, "regex-override"
     return verdict, conf, used
 
 
@@ -233,7 +274,9 @@ def judge_model_size(task):
 
 def selftest():
     """Prove every decision still returns a usable answer with no key."""
-    saved = os.environ.pop("OPENROUTER_API_KEY", None)
+    saved = os.environ.pop("JEV_API_KEY", None)
+    saved_or = os.environ.pop("OPENROUTER_API_KEY", None)
+    os.environ["JEV_TOKEN_FILE"] = "/nonexistent/no.token"
     os.environ["JEV_CACHE"] = "/tmp/jev-selftest-cache"
     print("jev fallback self-test (no key, no network needed)\n")
     results = []
@@ -262,7 +305,9 @@ def selftest():
     print("\n  availability: {}".format(
         "key present" if available() else "NO KEY — fallbacks in use"))
     if saved:
-        os.environ["OPENROUTER_API_KEY"] = saved
+        os.environ["JEV_API_KEY"] = saved
+    if saved_or:
+        os.environ["OPENROUTER_API_KEY"] = saved_or
     print("\n{}/{} passed".format(sum(results), len(results)))
     return 0 if all(results) else 1
 
@@ -285,13 +330,17 @@ def main():
     if a.primitive == "status" or not a.primitive:
         print("endpoint  {}".format(ENDPOINT))
         print("model     {}".format(MODEL))
-        print("key       {}".format("present" if available() else "MISSING"))
+        print("key       {}{}".format(
+            "present" if available() else "MISSING",
+            "  (from {})".format(token_file()) if not os.environ.get("JEV_API_KEY")
+            and available() else ""))
         print("cache     {} ({} entries)".format(
-            CACHE, len(list(CACHE.glob("*.json"))) if CACHE.exists() else 0))
+            cache_dir(),
+            len(list(cache_dir().glob("*.json"))) if cache_dir().exists() else 0))
         if not available():
-            print("\nNo OPENROUTER_API_KEY. Every decision falls back to its")
-            print("deterministic rule — nothing breaks, judgement is coarser.")
-            print("  export OPENROUTER_API_KEY=...")
+            print("\nNo key. Every decision falls back to its deterministic")
+            print("rule — nothing breaks, the judgement is just coarser.")
+            print("  export JEV_API_KEY=...   or   {}".format(token_file()))
         return 0
 
     if not a.state:

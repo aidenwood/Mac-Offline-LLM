@@ -72,6 +72,29 @@ These stay exactly as they are:
 The test: *does this question have a correct answer I can compute?* If yes, it
 is not a decision, it is a calculation. Jev is for the grey.
 
+## Room: Measured, not assumed
+
+Live on 2026-11-03, ~270ms per decision:
+
+| command | regex | jev |
+|---|---|---|
+| `rm -rf "$BUILD_DIR"` | safe | **catastrophic** — unset variable makes it `rm -rf /` |
+| `find / -name '*.gguf' -delete` | safe | **destructive** — would wipe the whole model store |
+| `rm -rf node_modules` | safe | safe |
+| `npm run build` | safe | safe |
+
+Both escalations are cases a pattern genuinely cannot catch: one depends on a
+variable's runtime value, the other on understanding what `find / -delete`
+reaches. Neither is obscure, and both would have run.
+
+finished / asked / partial / blocked, and small vs large model sizing, were
+also all correct at confidence 1.00.
+
+A known-bad command **short-circuits before the call** — the regex already
+refuses it and nothing Jev returns can change that, so paying ~300ms and
+tokens to discard the answer was waste. Pay for a decision only where it can
+change the outcome.
+
 ## Room: Preloading
 
 Decisions are deterministic for a given (state, question), so `bin/jev` caches
@@ -86,10 +109,20 @@ must not break a decision.
 ## Room: Setup
 
 ```bash
-export OPENROUTER_API_KEY=...     # Jev is served via OpenRouter
-jev status                        # key present? cache size?
-jev --selftest                    # prove the fallbacks, no key needed
+jev status            # endpoint, model, key source, cache size
+jev --selftest        # prove the fallbacks — forces the no-key path
 ```
+
+The key lives at `~/.claude/jev/aidxn.token`, chmod 600, outside any repo —
+the same shape as every other credential on this machine. `$JEV_API_KEY`
+overrides it so CI can run without a file. Never commit it; `.gitignore`
+blocks `*.token` and `apikey_*`.
+
+**The endpoint is `POST https://api.typesafe.ai/v1/systemone`, model
+`jev-latest`.** Third-party write-ups describe the OpenRouter route instead,
+which wants an `sk-or-v1-` key and rejects a native `apikey_` one with 401.
+The real paths came from `https://api.typesafe.ai/openapi.json` — it publishes
+a full spec, so read that rather than trusting a blog.
 
 Without a key, everything still runs. `jev status` says so plainly rather than
 pretending, for the same reason `--whip` prints a banner instead of silently

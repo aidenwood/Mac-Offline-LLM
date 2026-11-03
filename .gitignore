@@ -9,3 +9,12 @@ gguf/
 __pycache__/
 *.pyc
 *.log
+
+# Credentials — never, under any circumstances.
+# Jev keys live at ~/.claude/jev/<account>.token (chmod 600), never in-repo.
+*.token
+*.key
+.env
+.env.*
+!.env.example
+apikey_*
