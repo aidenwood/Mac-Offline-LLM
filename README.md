@@ -53,6 +53,13 @@ kv_cache      ≈ 0.5 GB per 8K context
 max_on_disk   = (usable - safety_margin - kv_cache) / 1.15
 ```
 
+There is a chart of this at [`docs/what-fits.html`](docs/what-fits.html) — model
+size against each machine's budget, with the one measured tier in the accent and
+the eight extrapolated ones recessive. It also surfaces something the table
+hides: **four tiers want more memory than the budget allows, and 36 GB lands
+exactly on the line** (21.0 GB resident against a 21.0 GB budget), which is why
+loading that model OOM'd here while another process held wired memory.
+
 Every recommendation in `models.json` is tagged `measured` or `extrapolated`, and
 the output says which. Only the 36 GB tier has been tested on real hardware so
 far — the rest are interpolated and labelled as such. A tool that asserts

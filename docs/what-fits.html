@@ -1,0 +1,333 @@
+<!doctype html>
+<!--
+  What fits — model size vs memory budget, by RAM tier.
+
+  Built with the dataviz skill. The procedure, in order:
+
+  1. FORM. The data's job is "compare magnitude, low→high" → bar. But the better
+     fit is EMPHASIS: one series is the point, the rest are context. Only the
+     36GB tier has been measured on real hardware; the other eight are
+     extrapolated. That distinction IS the story, so the measured row carries
+     the accent and everything else recedes to gray.
+
+  2-3. COLOR, VALIDATED — not eyeballed. scripts/validate_palette.js:
+         #8000C1 light  → ALL CHECKS PASS
+         #C147FF dark   → ALL CHECKS PASS (snapped from #C95FFF, whose L 0.682
+                          sat outside the dark band's 0.67 ceiling)
+         #7d7d78 gray   → ≥3:1 contrast (the first pick, #9a9a96, warned at 2.75)
+       Dark mode is SELECTED from the same ramp and re-validated against the
+       dark surface — not an automatic flip.
+
+  4. MARKS. Bars capped at 24px with a 4px rounded data-end and a square
+     baseline; a 2px surface gap between rows; recessive grid; direct labels on
+     every bar (nine rows is few enough that being selective would hide more
+     than it helps).
+
+  5. HOVER. Per-mark tooltip — required by default on a bar chart.
+
+  6. ACCESSIBILITY. Two marks, so a legend is present. Identity is never
+     color-alone: every row is labelled "MEASURED" or "est.". A table view
+     carries the same numbers. The contrast WARN on the gray is discharged by
+     the direct labels, as the rules require — not dismissed.
+
+  ONE AXIS. GB, shared by both marks. Never a second scale.
+
+  No innerHTML anywhere: the DOM is built with createElement/textContent, so
+  there is no string-to-markup path at all.
+-->
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>What fits — model size vs memory budget</title>
+<style>
+  :root {
+    --surface-1:  #fcfcfb;
+    --accent:     #8000C1;   /* validated light */
+    --deemph:     #7d7d78;   /* validated ≥3:1  */
+    --ink:        #1a1a19;
+    --ink-2:      #52524e;
+    --ink-muted:  #7d7d78;
+    --grid:       #e8e8e4;
+    --budget:     #52524e;
+  }
+
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --surface-1:  #1a1a19;
+      --accent:     #C147FF;  /* SELECTED for dark and revalidated, not flipped */
+      --deemph:     #8c8c87;
+      --ink:        #f2f2ef;
+      --ink-2:      #c4c4bf;
+      --ink-muted:  #8c8c87;
+      --grid:       #2e2e2c;
+      --budget:     #c4c4bf;
+    }
+  }
+
+  * { box-sizing: border-box; }
+
+  body {
+    margin: 0;
+    padding: 40px 32px 56px;
+    background: var(--surface-1);
+    color: var(--ink);
+    font: 14px/1.5 ui-sans-serif, -apple-system, "Segoe UI", system-ui, sans-serif;
+    -webkit-font-smoothing: antialiased;
+  }
+
+  .wrap { max-width: 760px; margin: 0 auto; }
+
+  h1 { font-size: 20px; font-weight: 650; margin: 0 0 4px; letter-spacing: -0.01em; }
+  .sub { color: var(--ink-2); margin: 0 0 4px; max-width: 62ch; }
+  .caveat { color: var(--ink-muted); font-size: 13px; margin: 0 0 24px; max-width: 62ch; }
+  .caveat b { color: var(--ink-2); }
+
+  .legend { display: flex; gap: 18px; align-items: center; margin: 0 0 20px; font-size: 13px; color: var(--ink-2); flex-wrap: wrap; }
+  .legend span { display: inline-flex; align-items: center; gap: 7px; }
+  .swatch { width: 14px; height: 10px; border-radius: 0 3px 3px 0; background: var(--accent); }
+  .swatch.ctx { background: var(--deemph); }
+  .tick-key { width: 2px; height: 14px; background: var(--budget); }
+
+  .chart { position: relative; }
+
+  .row {
+    display: grid;
+    grid-template-columns: 62px 1fr 150px;
+    align-items: center;
+    gap: 12px;
+    margin-bottom: 2px;          /* the 2px surface gap between touching marks */
+    padding: 5px 0;
+    border-radius: 4px;
+    position: relative;
+    z-index: 1;
+  }
+  .row:hover { background: color-mix(in srgb, var(--ink) 4%, transparent); }
+
+  .tier { text-align: right; color: var(--ink-2); font-variant-numeric: tabular-nums; }
+  .tier b { color: var(--ink); font-weight: 650; }
+
+  .track { position: relative; height: 24px; }   /* bars capped at 24px */
+
+  .bar {
+    position: absolute; left: 0; top: 0; bottom: 0;
+    background: var(--deemph);
+    border-radius: 0 4px 4px 0;                  /* rounded data-end, square baseline */
+    transition: filter .12s;
+  }
+  .row.measured .bar { background: var(--accent); }
+  .row:hover .bar { filter: brightness(1.08); }
+
+  /* The portion of a bar past the budget. Texture, not a second hue: status is
+     reserved and must never be mistaken for another series. It is paired with a
+     visible "over" tag, because status is never color-alone. */
+  .over {
+    position: absolute; top: 0; bottom: 0;
+    border-radius: 0 4px 4px 0;
+    background-image: repeating-linear-gradient(45deg,
+      color-mix(in srgb, var(--surface-1) 55%, transparent) 0 3px,
+      transparent 3px 6px);
+  }
+
+  .tag-over {
+    color: var(--ink-2); font-size: 11px; letter-spacing: .02em;
+    border: 1px solid var(--grid); border-radius: 3px;
+    padding: 1px 4px; margin-left: 4px; white-space: nowrap;
+  }
+
+  .budget {                                      /* second mark, same GB axis */
+    position: absolute; top: -3px; bottom: -3px; width: 2px;
+    background: var(--budget); border-radius: 1px;
+  }
+
+  .val { color: var(--ink-2); font-variant-numeric: tabular-nums; font-size: 13px; }
+  .row.measured .val { color: var(--ink); font-weight: 600; }
+  .val .tag { color: var(--ink-muted); font-size: 11px; letter-spacing: .02em; }
+  .row.measured .val .tag { color: var(--accent); font-weight: 650; }
+
+  .axis { display: grid; grid-template-columns: 62px 1fr 150px; gap: 12px;
+          margin-top: 10px; font-size: 12px; color: var(--ink-muted);
+          position: relative; z-index: 1; }
+  .axis-line { position: relative; height: 18px; }
+  .axis-line span { position: absolute; transform: translateX(-50%); font-variant-numeric: tabular-nums; }
+
+  .grid-v { position: absolute; top: 0; bottom: 28px; width: 1px; background: var(--grid); z-index: 0; }
+
+  .tip {
+    position: fixed; z-index: 10; pointer-events: none; opacity: 0;
+    background: var(--ink); color: var(--surface-1);
+    padding: 8px 10px; border-radius: 6px; font-size: 12px; line-height: 1.5;
+    transition: opacity .1s; max-width: 270px;
+  }
+  .tip .t-title { font-weight: 650; display: block; }
+  .tip .t-note { opacity: .78; display: block; margin-top: 3px; }
+  .tip .t-warn { color: #ffb4b4; font-weight: 650; }
+
+  details { margin-top: 32px; }
+  summary { cursor: pointer; color: var(--ink-2); font-size: 13px; }
+  table { border-collapse: collapse; margin-top: 12px; font-size: 13px; width: 100%; }
+  th, td { text-align: right; padding: 6px 10px; border-bottom: 1px solid var(--grid); font-variant-numeric: tabular-nums; }
+  th:first-child, td:first-child, th:nth-child(2), td:nth-child(2) { text-align: left; }
+  th { color: var(--ink-2); font-weight: 600; }
+  tr.measured td { font-weight: 600; }
+</style>
+</head>
+<body data-palette="#8000C1,#7d7d78">
+<div class="wrap">
+
+  <h1>What fits</h1>
+  <p class="sub">
+    Recommended model size against the memory budget each machine actually has,
+    by installed RAM.
+  </p>
+  <p class="caveat">
+    <b>One of these nine rows has been measured.</b> The 36&nbsp;GB tier was
+    tested on real hardware; the rest are extrapolated from the same
+    quantisation and architecture ratios. They are labelled, because a
+    recommendation presented as fact when it was never tested is how a tool
+    stops being trustworthy.
+  </p>
+
+  <div class="legend">
+    <span><i class="swatch"></i> measured</span>
+    <span><i class="swatch ctx"></i> extrapolated</span>
+    <span><i class="tick-key"></i> memory budget</span>
+    <span><i class="swatch ctx" style="background-image:repeating-linear-gradient(45deg,rgba(252,252,251,.55) 0 3px,transparent 3px 6px)"></i> over budget</span>
+  </div>
+
+  <div class="chart" id="chart"></div>
+
+  <details>
+    <summary>Table view</summary>
+    <table id="table">
+      <thead>
+        <tr><th>RAM</th><th>Model</th><th>Disk GB</th><th>Resident GB</th><th>Budget GB</th><th>Source</th></tr>
+      </thead>
+      <tbody></tbody>
+    </table>
+  </details>
+</div>
+
+<div class="tip" id="tip" role="status" aria-live="polite"></div>
+
+<script>
+// From models.json, plus the budget formula in bin/llm-recommend:
+//   budget = (ram - os(4) - apps(2, idle) - 0.15*ram - kv(0.5)) / 1.15
+const DATA = [
+  { ram:   8, model: "qwen2.5-coder:1.5b", disk:  1.0, resident:  1.5, measured: false },
+  { ram:  16, model: "qwen2.5-coder:7b",   disk:  4.4, resident:  6.0, measured: false },
+  { ram:  24, model: "gpt-oss:20b",        disk: 12.0, resident: 14.0, measured: false },
+  { ram:  32, model: "gpt-oss:20b",        disk: 12.0, resident: 14.0, measured: false },
+  { ram:  36, model: "qwen3-coder:30b",    disk: 18.0, resident: 21.0, measured: true  },
+  { ram:  48, model: "qwen3-coder:30b",    disk: 18.0, resident: 21.0, measured: false },
+  { ram:  64, model: "qwen3-coder:30b",    disk: 18.0, resident: 21.0, measured: false },
+  { ram:  96, model: "gpt-oss:120b",       disk: 65.0, resident: 75.0, measured: false },
+  { ram: 128, model: "gpt-oss:120b",       disk: 65.0, resident: 75.0, measured: false },
+];
+
+const budget = (ram) => Math.max(0, ram - 4 - 2 - 0.15 * ram - 0.5) / 1.15;
+const MAX    = Math.max(...DATA.map(d => Math.max(d.resident, budget(d.ram)))) * 1.06;
+const TICKS  = [0, 20, 40, 60, 80].filter(v => v <= MAX);
+const pct    = (v) => (v / MAX * 100) + "%";
+
+const el = (tag, cls, text) => {
+  const n = document.createElement(tag);
+  if (cls)  n.className = cls;
+  if (text != null) n.textContent = text;
+  return n;
+};
+
+const chart = document.getElementById("chart");
+const tip   = document.getElementById("tip");
+
+// Recessive gridlines first, so every mark sits above them.
+for (const v of TICKS) {
+  const g = el("div", "grid-v");
+  g.style.left = "calc(74px + (100% - 236px) * " + (v / MAX) + ")";
+  chart.appendChild(g);
+}
+
+for (const d of DATA) {
+  const b    = budget(d.ram);
+  const fits = d.resident <= b;
+
+  const row = el("div", "row" + (d.measured ? " measured" : ""));
+
+  const tier = el("div", "tier");
+  tier.appendChild(el("b", null, String(d.ram)));
+  tier.appendChild(document.createTextNode(" GB"));
+
+  const track = el("div", "track");
+  const bar   = el("div", "bar");
+  bar.style.width = pct(d.resident);
+  const tick  = el("div", "budget");
+  tick.style.left = pct(b);
+  track.append(bar);
+
+  // Mark the part of the bar the machine cannot actually hold.
+  if (!fits) {
+    const over = el("div", "over");
+    over.style.left  = pct(b);
+    over.style.width = pct(d.resident - b);
+    track.appendChild(over);
+  }
+  track.appendChild(tick);
+
+  const val = el("div", "val", d.resident.toFixed(0) + " GB ");
+  val.appendChild(el("span", "tag", d.measured ? "MEASURED" : "est."));
+  if (!fits) val.appendChild(el("span", "tag-over", "over"));
+
+  row.append(tier, track, val);
+
+  row.addEventListener("mousemove", (e) => {
+    tip.replaceChildren();
+    tip.appendChild(el("span", "t-title", d.ram + " GB → " + d.model));
+    tip.appendChild(el("span", "t-note",
+      d.resident.toFixed(1) + " GB resident · " + d.disk.toFixed(1) + " GB on disk"));
+
+    const fit = el("span", "t-note", "budget " + b.toFixed(1) + " GB — ");
+    fit.appendChild(fits ? document.createTextNode("fits")
+                         : el("b", "t-warn", "does not fit"));
+    tip.appendChild(fit);
+
+    tip.appendChild(el("span", "t-note",
+      d.measured ? "measured on this hardware" : "extrapolated — not tested"));
+
+    tip.style.opacity = "1";
+    tip.style.left = Math.min(e.clientX + 14, innerWidth - 282) + "px";
+    tip.style.top  = (e.clientY + 16) + "px";
+  });
+  row.addEventListener("mouseleave", () => { tip.style.opacity = "0"; });
+
+  chart.appendChild(row);
+}
+
+// Axis last.
+const axis = el("div", "axis");
+axis.appendChild(el("div"));
+const line = el("div", "axis-line");
+for (const v of TICKS) {
+  const s = el("span", null, String(v));
+  s.style.left = (v / MAX * 100) + "%";
+  line.appendChild(s);
+}
+axis.appendChild(line);
+const unit = el("div", null, "GB");
+unit.style.cssText = "font-size:12px;color:var(--ink-muted)";
+axis.appendChild(unit);
+chart.appendChild(axis);
+
+// Table view — the same numbers, for anyone the chart does not serve.
+const tbody = document.querySelector("#table tbody");
+for (const d of DATA) {
+  const tr = el("tr", d.measured ? "measured" : null);
+  for (const cell of [d.ram + " GB", d.model, d.disk.toFixed(1),
+                      d.resident.toFixed(1), budget(d.ram).toFixed(1),
+                      d.measured ? "measured" : "extrapolated"]) {
+    tr.appendChild(el("td", null, cell));
+  }
+  tbody.appendChild(tr);
+}
+</script>
+</body>
+</html>
